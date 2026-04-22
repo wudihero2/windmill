@@ -11,7 +11,8 @@
 | [04-worker-executor](./04-worker-executor.md) | 多語言 Worker | 沙箱隔離、語言執行器、快取 |
 | [05-flow-engine](./05-flow-engine.md) | 工作流引擎 | 狀態機、分支、迭代、暫停/恢復 |
 | [06-frontend](./06-frontend.md) | Svelte 前端 | Flow Editor、Script Editor、App Builder |
-| [07-beyond-windmill](./07-beyond-windmill.md) | 超越 Windmill | 差異化功能、iggy、高效能資料源 |
+| [07-beyond-windmill](./07-beyond-windmill.md) | 超越 Windmill | 差異化功能、iggy、高效能資料源、事件處理分析 |
+| [08-source-map](./08-source-map.md) | 源碼地圖 | 每個篇章對應的原始碼檔案路徑 |
 
 ---
 

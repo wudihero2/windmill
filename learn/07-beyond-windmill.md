@@ -427,6 +427,143 @@ async fn execute_job(job: &QueuedJob) -> Result<Value> {
 - [ ] OpenTelemetry
 - [ ] 自動 DAG 並行化
 
+## 深入：Windmill 的事件處理能力
+
+### Windmill 已支援的 Trigger 種類
+
+Windmill 其實已經有相當完整的事件觸發能力，共 **14 種 trigger**：
+
+```rust
+// backend/windmill-types/src/triggers.rs
+pub enum TriggerKind {
+    Webhook,           // HTTP webhooks
+    Http,              // HTTP polling
+    Websocket,         // WebSocket 長連線（串流）
+    Kafka,             // Kafka 訊息佇列
+    DefaultEmail,      // 預設 Email
+    Email,             // 自訂 Email
+    Nats,              // NATS 訊息匯流排
+    Mqtt,              // MQTT pub/sub（IoT 常用）
+    Sqs,               // AWS SQS 佇列
+    Postgres,          // PostgreSQL LISTEN/NOTIFY
+    Gcp,               // Google Cloud Pub/Sub
+    Nextcloud,         // Nextcloud 事件
+    Google,            // Google Workspace 整合
+    Github,            // GitHub webhooks/events
+}
+```
+
+### WebSocket Trigger — 最接近 Event Streaming 的實作
+
+WebSocket trigger 是 Windmill 中最接近真正串流處理的功能：
+
+```rust
+// backend/windmill-trigger-websocket/src/listener.rs (line ~181)
+// consume() 用 tokio::select! 同時管理三個任務
+tokio::select! {
+    _ = killpill_rx.recv() => {},          // 關閉信號
+    _ = self.loop_ping(...) => {},         // 健康檢查
+    _ = async { /* heartbeat */ } => {},   // 定期心跳
+    _ = async {
+        loop {
+            if let Some(msg) = reader.next().await {
+                // 過濾訊息並觸發 flow
+            }
+        }
+    } => {}
+}
+```
+
+WebSocket trigger 支援：
+- **持久連線**：維持與 WebSocket server 的長連線
+- **事件過濾**：`filter_logic`（"and"/"or"）過濾訊息
+- **雙向通訊**：flow 執行結果可以回傳 WebSocket
+- **心跳保活**：定期發送 heartbeat 維持連線
+- **初始訊息**：連線時發送 setup 訊息
+
+```rust
+// backend/windmill-trigger-websocket/src/handler.rs (line ~335)
+let use_or = listening_trigger.trigger_config.filter_logic == "or";
+let should_handle = check_filters(&text, &filters, use_or);
+if should_handle {
+    let _ = self.handle_event(db, listening_trigger, text,
+        trigger_info, return_message_channels.clone()).await;
+}
+```
+
+### Suspend/Resume — 等待外部事件
+
+Flow 可以暫停等待外部事件：
+
+```rust
+// backend/windmill-types/src/flows.rs (line ~386)
+pub struct Suspend {
+    pub required_events: Option<u32>,              // 需要幾個事件才繼續
+    pub timeout: Option<u32>,                      // 超時（秒）
+    pub resume_form: Option<serde_json::Value>,    // 審批表單 UI
+    pub user_auth_required: Option<bool>,          // 是否需要認證
+    pub user_groups_required: Option<InputTransform>,
+    pub self_approval_disabled: Option<bool>,
+    pub hide_cancel: Option<bool>,
+    pub continue_on_disapprove_timeout: Option<bool>,
+}
+```
+
+### Trigger 的錯誤處理與重試
+
+```rust
+// backend/windmill-trigger/src/types.rs (line ~57)
+pub struct TriggerErrorHandling {
+    pub error_handler_path: Option<String>,      // 錯誤處理 script/flow
+    pub error_handler_args: Option<...>,         // 錯誤處理參數
+    pub retry: Option<Retry>,                    // 重試設定
+}
+```
+
+### Windmill Event Processing 的限制
+
+| 面向 | Windmill 現狀 | 限制 |
+|------|-------------|------|
+| 事件模型 | 每個事件 → 獨立 job | 無 event bus，不能做跨事件關聯 |
+| CEP | 不支援 | 無法做「事件 A 和 B 在 5 分鐘內同時發生才觸發」 |
+| Suspend/Resume | 主要用於人工審批 | 不是通用的 event-wait 機制 |
+| 串流處理 | WebSocket 最接近 | 但每個訊息仍是獨立 job，無批次/窗口處理 |
+| Trigger 擴展 | 14 種硬寫 | 無通用 Event Adapter 框架 |
+
+### 你可以超越的方向
+
+| Windmill 的做法 | 超越方向 |
+|-----------------|---------|
+| 每個事件 → 獨立 job | 事件匯流排（Iggy/NATS）+ 批次處理 |
+| 14 種硬寫的 trigger | 通用 Event Adapter 框架（plugin 化） |
+| 無 CEP | 時間窗口、事件關聯、模式匹配引擎 |
+| Suspend 只等審核 | 通用的 event-wait step（等待任意外部事件） |
+| PostgreSQL queue 為核心 | 專用 message broker 處理高吞吐 |
+| 觸發式（Event → Job） | 串流式（持續處理事件流、滑動窗口聚合） |
+
+### 結論
+
+Windmill 的 event processing 是**「觸發式」**的：
+
+```
+事件到達 → push 一個 job 進 PostgreSQL queue → Worker 處理 → 完成
+```
+
+而非**「串流式」**的：
+
+```
+事件流 → Event Bus → 窗口/聚合/關聯 → 產生新事件 → 觸發下游
+```
+
+如果要做真正的 event-driven platform，需要在 Windmill 的 trigger 架構之上加入：
+
+1. **Event Bus**（Iggy/NATS JetStream）作為事件路由核心
+2. **CEP 引擎**（時間窗口、事件關聯、模式匹配）
+3. **通用 Event Adapter**（plugin 化的 trigger 框架）
+4. **串流聚合**（滑動窗口、tumbling window、session window）
+
+---
+
 ## 結語
 
 Windmill 是一個成熟的產品（544 個 migration、1436 個前端組件、25+ 種語言支援），從零重建它不現實。但你可以：

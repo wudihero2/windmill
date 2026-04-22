@@ -711,10 +711,172 @@ Layer 3: Job 結果快取（cache_ttl）
 7. **沙箱** — nsjail（Linux only）或 Docker
 8. **依賴快取** — hash-based 本地快取
 
-### 如果你不想用 nsjail
+## 深入：為什麼用 nsjail 而不是 Kubernetes Pod？
 
-替代方案：
-- **Docker containers** — 每個 job 一個容器（更慢但更安全）
-- **Firecracker microVMs** — AWS Lambda 使用的方案
-- **WASM** — 用 Wasmtime 執行（限制最多但最安全）
-- **不做沙箱** — 如果是內部使用且信任所有使用者
+### nsjail 的設定與控制
+
+nsjail **預設是關閉的**，由環境變數和 Instance Settings 控制：
+
+```rust
+// backend/windmill-worker/src/worker.rs (line ~340)
+pub static ref DISABLE_NSJAIL: bool = std::env::var("DISABLE_NSJAIL")
+    .ok()
+    .and_then(|x| x.parse::<bool>().ok())
+    .unwrap_or(true);  // 預設 TRUE → nsjail 不啟用
+
+pub static ref JOB_ISOLATION: AtomicU8 = AtomicU8::new(JobIsolationLevel::Undefined as u8);
+```
+
+四種隔離等級：
+
+| 等級 | 說明 | 啟動延遲 |
+|------|------|---------|
+| `Undefined` (0) | 由環境變數決定 | - |
+| `None` (1) | 不隔離 | 0ms |
+| `Unshare` (2) | 只隔離 PID namespace | ~1ms |
+| `NsjailSandboxing` (3) | 完整 nsjail 沙箱 | ~10-50ms |
+
+```rust
+pub fn is_sandboxing_enabled() -> bool {
+    if !*DISABLE_NSJAIL {
+        return true;
+    }
+    match get_job_isolation() {
+        JobIsolationLevel::NsjailSandboxing => true,
+        _ => false,
+    }
+}
+```
+
+### nsjail 做了什麼隔離
+
+`backend/windmill-worker/nsjail/` 有 19 個語言專屬的設定檔。以 Python 為例：
+
+```protobuf
+# run.python3.config.proto
+
+# --- 檔案系統隔離 ---
+mount { src: "/bin"   dst: "/bin"   is_bind: true  rw: false }  # 唯讀
+mount { src: "/lib"   dst: "/lib"   is_bind: true  rw: false }
+mount { src: "/usr"   dst: "/usr"   is_bind: true  rw: false }
+mount { src: "{JOB_DIR}"  dst: "/tmp"  is_bind: true  rw: true }  # 只有 job 目錄可寫
+mount { dst: "/tmp"  fstype: "tmpfs"  rw: true  options: "size=500m" }
+
+# --- 資源限制 ---
+rlimit_as: 4096        # 虛擬記憶體 4GB
+rlimit_cpu: 1000       # CPU 時間 1000 秒
+rlimit_fsize: 1000     # 檔案大小限制
+rlimit_nofile: 10000   # 最大 file descriptor
+
+# --- 網路 ---
+clone_newnet: false     # 不隔離網路（job 需要存取外部 API）
+iface_no_lo: true       # 但禁止 loopback（防止 job 之間互通）
+
+# --- Namespace ---
+clone_newuser: true     # 隔離 user namespace
+mode: ONCE              # 執行一次就退出
+```
+
+### nsjail 的呼叫方式
+
+```rust
+// backend/windmill-worker/src/bash_executor.rs
+let nsjail_config = NSJAIL_CONFIG_RUN_BASH_CONTENT
+    .replace("{JOB_DIR}", job_dir)
+    .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
+    .replace("{SHARED_MOUNT}", shared_mount)
+    .replace("{TIMEOUT}", &nsjail_timeout);
+
+write_file(job_dir, "run.config.proto", &nsjail_config)?;
+
+let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
+nsjail_cmd
+    .current_dir(job_dir)
+    .env_clear()                       // 清空環境變數
+    .envs(reserved_variables)          // 只注入 WM_* 變數
+    .args(&["--config", "run.config.proto", "--", "/bin/bash", "wrapper.sh"])
+    .spawn()?;
+```
+
+### 為什麼不用 Kubernetes Pod 跑每個 Job？
+
+這是一個很好的問題。Airflow 的模式是 `KubernetesPodOperator`——每個 task 啟動一個 K8s Pod。Windmill 為什麼不這樣做？
+
+#### 延遲對比
+
+| 方案 | 啟動延遲 | 說明 |
+|------|---------|------|
+| 不隔離 | ~0ms | 直接 `Command::new("python")` |
+| nsjail | ~10-50ms | Linux namespace + bind mount |
+| Docker | ~500ms-2s | Container runtime + overlay fs |
+| K8s Pod | ~2-10s | 排程 + 容器啟動 + 網路設定 |
+| K8s Pod (cold) | ~10-30s | 加上 image pull |
+
+Windmill 的定位是**低延遲的 job 執行**（大量小 job），2-10 秒的 Pod 啟動延遲是不可接受的。
+
+#### 架構差異
+
+```
+Airflow 模式（K8s Pod per Task）：
+  Scheduler → K8s API → Pod 排程 → 拉 image → 啟動容器 → 執行 → 回報
+  延遲：5-30 秒
+  適合：長時間 ETL（分鐘到小時級）
+
+Windmill 模式（常駐 Worker + nsjail）：
+  Queue → Worker poll → nsjail spawn → 執行 → 完成
+  延遲：10-50 毫秒
+  適合：大量快速 job（秒到分鐘級）
+```
+
+#### 為什麼 Windmill 不採用 K8s Pod
+
+1. **延遲**：nsjail 10ms vs K8s Pod 5s，差 500 倍
+2. **依賴快取**：Worker 本地快取 pip/npm/cargo，每次 Pod 重建要重新安裝
+3. **簡單性**：不依賴 K8s，bare metal / Docker Compose 也能跑
+4. **資源效率**：一個 Worker 程序可以連續跑數千個 job，不用每次建/刪 Pod
+5. **K8s API 壓力**：每秒數千 job 會把 K8s API Server 打爆
+
+#### Windmill 的 K8s 支援是什麼？
+
+Windmill 的 K8s 整合是 **Worker 自動擴縮**（EE 功能），不是 Pod-per-Job：
+
+```
+Windmill 的 K8s 模式：
+  Queue 積壓 → Autoscaler 偵測 → 增加 Worker Pod 數量 → Worker 搶 job
+  （Worker Pod 是長期存活的，不是每個 job 一個 Pod）
+
+NOT:
+  每個 Job → 建立 Pod → 執行 → 刪除 Pod
+```
+
+```rust
+// backend/windmill-autoscaling/src/ (Enterprise Edition)
+// 管理 Worker Pod 數量，不是管理 Job Pod
+apply_kubernetes_autoscaling()  // 根據 queue 深度調整 Worker 副本數
+```
+
+### 什麼時候 K8s Pod 模式比較好？
+
+| 場景 | nsjail (Windmill) | K8s Pod (Airflow) |
+|------|-------------------|-------------------|
+| 大量小 job（< 1 分鐘） | 最佳 | 啟動延遲佔比太高 |
+| 長時間 ETL（> 10 分鐘） | 可以 | 啟動延遲可忽略 |
+| 需要不同 Docker image | 不支援 | 最佳 |
+| 需要 GPU | 要手動掛載 | K8s 原生支援 |
+| 多租戶強隔離 | nsjail 夠用 | Pod 隔離更強 |
+| 每個 job 需要不同依賴版本 | 靠快取區分 | 每個 image 獨立 |
+
+### 如果你想兩者兼得
+
+```
+你的系統可以同時支援：
+
+快速 job → nsjail / WASM 沙箱（毫秒級啟動）
+重型 job → K8s Pod（支援自訂 image、GPU）
+
+透過 tag 路由：
+  tag = "fast"  → 常駐 Worker + nsjail
+  tag = "heavy" → K8s Job Controller → 動態建 Pod
+```
+
+這就是你可以超越 Windmill 的方向之一：**混合執行模式**。

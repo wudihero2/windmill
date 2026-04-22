@@ -593,6 +593,250 @@ pub struct ExponentialRetry {
 }
 ```
 
+## 深入：Task Output → 下一個 Task 的 Input
+
+這是 Flow Engine 最核心的機制：如何讓步驟之間傳遞資料。
+
+### 結果儲存與大小限制
+
+每個 Flow step 完成後，結果存入 `v2_job_completed` 表的 `result JSONB` 欄位。
+
+**但結果不會無限大**——Windmill 有三層保護：
+
+```rust
+// backend/windmill-queue/src/jobs.rs (line ~1302)
+async fn check_result_size<T: ValidableJson>(
+    db: &Pool<Postgres>,
+    queued_job: &MiniCompletedJob,
+    result: Json<&T>,
+) -> Option<Result<...>> {
+    let result_size = result.size() / 1024 / 1024;  // 轉 MB
+
+    if result_size > 2 {
+        if result_size > *MAX_RESULT_SIZE_MB {
+            // 超過上限（預設 500MB）→ 直接報錯，不存
+            return Some(Err(Error::ResultTooLarge(...)));
+        }
+        if *CLOUD_HOSTED {
+            // Cloud 版 → > 2MB 直接拒絕
+            return Some(Err(Error::ResultTooLarge(...)));
+        } else {
+            // Self-hosted → 只是警告
+            tracing::warn!("Result larger than 2MB: {}MB. Not recommended.", result_size);
+        }
+    }
+    None  // 大小合格，繼續存
+}
+```
+
+**大小限制層級：**
+
+| 環境 | < 2MB | 2MB ~ 500MB | > 500MB |
+|------|-------|-------------|---------|
+| Cloud 版 | 正常存 | 拒絕 | 拒絕 |
+| Self-hosted | 正常存 | 警告但存 | 拒絕（可透過 `MAX_RESULT_SIZE_MB` 調整） |
+
+**大結果的正確做法**——使用 Object Storage：
+
+```
+小結果 (< 2MB)：
+  Step A result → 直接存 v2_job_completed.result (JSONB)
+  Step B → SELECT result FROM v2_job_completed WHERE id = $1
+
+大結果 (> 2MB)：
+  Step A → 寫入 S3/MinIO → result 只存 {"s3": "path/to/file"} (幾十 bytes)
+  Step B → 從 result 拿到 S3 path → 去 S3 讀取實際資料
+```
+
+Windmill 有完整的 S3 整合（`windmill-object-store` crate），支援 S3、MinIO、Azure Blob、本地檔案系統。大部分 job 結果是小 JSON，存 DB 最簡單；真正大的資料走 Object Storage。
+
+### 結果查詢
+
+每個 Flow step 完成後，從 `v2_job_completed` 表查詢結果：
+
+```rust
+// backend/windmill-worker/src/worker_flow.rs (line ~2100)
+async fn retrieve_flow_jobs_results(
+    db: &DB,
+    w_id: &str,
+    job_uuids: &Vec<Uuid>,
+) -> error::Result<Box<RawValue>> {
+    let results = sqlx::query!(
+        "SELECT result, id FROM v2_job_completed WHERE id = ANY($1) AND workspace_id = $2",
+        job_uuids.as_slice(),
+        w_id
+    )
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|br| (br.id, br.result))
+    .collect::<HashMap<_, _>>();
+    // ...
+}
+```
+
+### 建立結果 Context
+
+系統把所有步驟的結果收集到一個 `IdContext` 中，這是 `results.step_name` 語法的底層實作：
+
+```rust
+// backend/windmill-worker/src/worker_flow.rs (line ~5474)
+fn get_transform_context(
+    flow_job: &MiniPulledJob,
+    previous_id: &str,
+    status: &FlowStatus,
+) -> IdContext {
+    let steps_results: HashMap<String, JobResult> = status
+        .modules
+        .iter()
+        .filter_map(|x| x.job_result().map(|y| (x.id(), y)))
+        .collect();
+
+    IdContext {
+        flow_job: flow_job.id,
+        steps_results,                        // results.xxx 的來源
+        previous_id: previous_id.to_string(), // result / previous_result 的來源
+    }
+}
+```
+
+### InputTransform 三種類型
+
+```rust
+// backend/windmill-types/src/flows.rs (line ~632)
+pub enum InputTransform {
+    Static { value: Box<RawValue> },    // 固定值（如 42、"hello"）
+    Javascript { expr: String },         // JS 表達式（如 results.step_a.count + 1）
+    Ai,                                  // AI 驅動的轉換
+}
+```
+
+### JS 表達式求值
+
+```rust
+// backend/windmill-worker/src/worker_flow.rs (line ~2320)
+InputTransform::Javascript { expr } => {
+    let mut context = HashMap::with_capacity(2);
+    context.insert("result".to_string(), last_result.clone());
+    context.insert("previous_result".to_string(), last_result.clone());
+
+    let result = eval_timeout(
+        expr.to_string(),
+        context,        // result / previous_result
+        flow_args,      // Flow 輸入參數
+        flow_env,       // 環境變數
+        authed_client,
+        by_id,          // IdContext → results.step_name
+        None,
+    )
+    .warn_after_seconds(3)
+    .await
+}
+```
+
+### 在 JS 中可存取的變數
+
+| 變數 | 來源 | 範例 |
+|------|------|------|
+| `result` | 前一步輸出 | `result.count` |
+| `previous_result` | 同 `result` | `previous_result.data` |
+| `results.step_name` | 任意步驟的輸出（透過 `IdContext.steps_results`） | `results.fetch_users.length` |
+| `params` | Flow 的輸入參數 | `params.api_key` |
+| `flow_args` | Flow 級別的所有變數 | - |
+| `resume` | Suspend/Resume 的回傳值 | `resume.approved` |
+| `resumes` | 多個 resume 事件的陣列 | `resumes[0].value` |
+| `approvers` | 審批者資訊 | `approvers[0].email` |
+
+### 完整的 transform_input 流程
+
+```rust
+// backend/windmill-worker/src/worker_flow.rs (line ~2367)
+async fn transform_input(
+    flow_args: Marc<HashMap<String, Box<RawValue>>>,
+    last_result: Arc<Box<RawValue>>,
+    input_transforms: &HashMap<String, InputTransform>,
+    by_id: &IdContext,
+    // ...
+) -> Result<HashMap<String, Box<RawValue>>> {
+    let mut mapped = HashMap::new();
+
+    for (key, val) in input_transforms.into_iter() {
+        match val {
+            InputTransform::Static { value } => {
+                mapped.insert(key.clone(), value.clone());
+            }
+            InputTransform::Javascript { expr } => {
+                let v = eval_timeout(
+                    expr.to_string(),
+                    env.clone(),           // result, previous_result, resume, approvers
+                    Some(flow_args.clone()),// params
+                    flow_env,
+                    Some(client),
+                    Some(by_id),           // results.step_name
+                    None,
+                ).await?;
+                mapped.insert(key.to_string(), v);
+            }
+            InputTransform::Ai => { /* AI 處理 */ }
+        }
+    }
+    Ok(mapped)
+}
+```
+
+### For Loop 中的資料傳遞
+
+For Loop 的 `iterator` 本身就是一個 `InputTransform`，可以引用前一步的結果：
+
+```rust
+// backend/windmill-types/src/flows.rs (line ~853)
+ForloopFlow {
+    iterator: InputTransform,   // 求值為陣列（如 results.fetch_users）
+    modules: Vec<FlowModule>,   // 每次迭代執行的步驟
+    skip_failures: bool,
+    parallel: bool,             // 可並行迭代
+    parallelism: Option<InputTransform>,
+}
+```
+
+```rust
+// backend/windmill-worker/src/worker_flow.rs (line ~5105)
+// iterator 表達式求值
+InputTransform::Javascript { expr } => {
+    let mut context = HashMap::with_capacity(5);
+    context.insert("result".to_string(), arc_last_job_result.clone());
+    context.insert("previous_result".to_string(), arc_last_job_result);
+    context.insert("resumes".to_string(), resumes);
+    context.insert("resume".to_string(), resume);
+    context.insert("approvers".to_string(), approvers);
+
+    eval_timeout(expr, context, Some(arc_flow_job_args), flow_env,
+        Some(client), Some(&by_id), None).await?
+}
+```
+
+每次迭代收到的參數格式：`{ index: i32, value: <item> }`
+
+### 資料流總結
+
+```
+Step A 執行完成
+    ↓ 結果存入 v2_job_completed
+    ↓
+Flow Engine 更新 FlowStatus
+    ↓ 收集所有步驟結果 → IdContext { steps_results }
+    ↓
+Step B 開始前：transform_input()
+    ↓ 對每個 input_transforms 求值
+    ↓ JS 表達式可存取：result, results.step_a, params
+    ↓
+Step B 的 args = 轉換後的 HashMap
+    ↓
+Step B 執行（帶著來自 Step A 的資料）
+```
+
+---
+
 ## 你的實作順序
 
 1. **最簡 Flow** — 只有 Sequential steps（A → B → C）
