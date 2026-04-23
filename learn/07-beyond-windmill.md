@@ -564,6 +564,371 @@ Windmill 的 event processing 是**「觸發式」**的：
 
 ---
 
+## 深入：Windmill 如何鎖定企業功能（Licensing 機制）
+
+這是一個很有趣的工程問題：開源專案如何在程式碼公開的情況下鎖住付費功能？
+
+### 三層防線
+
+Windmill 用了**三層機制**確保企業功能需要授權：
+
+#### 第 1 層：編譯時隔離 — Feature Flags + 私有 repo
+
+```toml
+# backend/Cargo.toml
+[features]
+enterprise = ["windmill-worker/enterprise", "windmill-queue/enterprise", ...]
+private = [...]    # 閉源程式碼的 feature flag
+license = [...]    # 需要 license key 驗證的功能
+```
+
+企業程式碼放在**另一個私有 repo**（`windmill-ee-private`），透過 symlink 引入：
+
+```
+backend/
+├── src/ee_oss.rs          # 開源版 — 所有函式都是空殼
+├── src/ee.rs → symlink    # 指向 windmill-ee-private 的真正實作
+└── windmill-common/
+    └── src/ee_oss.rs      # 開源版的 stub
+```
+
+開源版的 `ee_oss.rs` 長這樣：
+
+```rust
+// backend/src/ee_oss.rs — 這是你在 GitHub 上看到的
+#[cfg(not(feature = "private"))]
+pub async fn set_license_key(_license_key: String, _db: Option<&DB>) -> () {
+    // Implementation is not open source
+}
+
+#[cfg(all(feature = "enterprise", not(feature = "private")))]
+pub async fn verify_license_key() -> () {
+    // Implementation is not open source
+}
+```
+
+```rust
+// backend/windmill-common/src/ee_oss.rs — 開源版的 license 狀態
+#[cfg(not(feature = "private"))]
+lazy_static! {
+    pub static ref LICENSE_KEY_VALID: AtomicBool = AtomicBool::new(true);  // 開源版永遠 true
+    pub static ref LICENSE_KEY_ID: ArcSwap<String> = ArcSwap::from_pointee("".to_string());
+}
+
+#[cfg(not(feature = "private"))]
+pub async fn get_license_plan() -> LicensePlan {
+    return Community;  // 開源版永遠回傳 Community
+}
+```
+
+**關鍵**：開源版 `LICENSE_KEY_VALID` 永遠是 `true`，所以開源版不需要 license key。但企業版（用 `private` feature 編譯）會用 `ee.rs` 替換掉這些 stub，裡面有真正的驗證邏輯。
+
+#### 第 2 層：運行時 License Key 驗證
+
+企業版二進制檔在啟動時和執行時都會檢查 license key：
+
+```rust
+// backend/src/main.rs (line ~960)
+// 啟動時
+if let Err(err) = reload_license_key(&conn).await { ... }
+let valid_key = LICENSE_KEY_VALID.load(Ordering::Relaxed);
+if !valid_key && !server_mode {
+    tracing::error!("Invalid license key, workers require a valid license key");
+}
+
+// 嘗試線上續約
+let renewed_now = maybe_renew_license_key_on_start(
+    &HTTP_CLIENT, &db,
+    !valid_key && !LICENSE_KEY_ID.load().is_empty(), // 有 key 但過期 → 強制續約
+).await;
+```
+
+**Worker 主迴圈**中也檢查——沒有有效 key 就**拒絕處理 job**：
+
+```rust
+// backend/windmill-worker/src/worker.rs (line ~2142)
+#[cfg(feature = "enterprise")]
+{
+    let valid_key = LICENSE_KEY_VALID.load(Ordering::Relaxed);
+    if !valid_key {
+        tracing::error!("Invalid license key, sleeping for 10s waiting for valid key");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        continue;  // 不處理任何 job
+    }
+}
+```
+
+**排程也擋**：
+
+```rust
+// backend/windmill-queue/src/schedule.rs (line ~133)
+if !LICENSE_KEY_VALID.load(Ordering::Relaxed) {
+    return Err(Error::BadRequest(
+        "License key is not valid. Go to superadmin settings to update."
+    ));
+}
+```
+
+**API 也擋**：
+
+```rust
+// backend/windmill-api-jobs/src/execution.rs (line ~64)
+#[cfg(feature = "enterprise")]
+pub async fn check_license_key_valid() -> Result<()> {
+    let valid = LICENSE_KEY_VALID.load(Ordering::Relaxed);
+    if !valid {
+        return Err(Error::BadRequest("License key is not valid."));
+    }
+    Ok(())
+}
+```
+
+#### 第 3 層：License Key 續約（需要聯網）
+
+```rust
+// backend/windmill-common/src/ee_oss.rs
+pub async fn maybe_renew_license_key_on_start(
+    _http_client: &reqwest::Client,   // 用 HTTP 呼叫 Windmill 的授權伺服器
+    _db: &DB,
+    force_renew_now: bool,
+) -> bool {
+    // Implementation is not open source
+}
+
+pub async fn renew_license_key(
+    _http_client: &reqwest::Client,   // 線上續約
+    _db: &DB,
+    _key: Option<String>,
+    _reason: RenewReason,             // Manual / Schedule / OnStart
+) -> String {
+    // Implementation is not open source
+}
+```
+
+定期驗證（在 `monitor.rs` 的背景循環中）：
+
+```rust
+// backend/src/monitor.rs (line ~2351)
+let verify_license_key_f = async {
+    loop {
+        verify_license_key().await;  // 定期呼叫（真正實作在私有 repo）
+        tokio::time::sleep(...).await;
+    }
+};
+```
+
+### 回答你的問題：私有網路也能鎖嗎？
+
+**可以，但方式不同：**
+
+```
+場景 1：有網路
+  啟動 → reload_license_key() → 本地驗證 key 格式/簽章
+  定期 → verify_license_key() → 呼叫 Windmill 授權伺服器驗證
+  到期 → renew_license_key() → 線上續約
+
+場景 2：私有網路（無外網）
+  啟動 → reload_license_key() → 本地驗證 key 格式/簽章
+  定期 → verify_license_key() → 無法呼叫外部 → ？
+```
+
+雖然真正的驗證邏輯在私有 repo 看不到，但根據程式碼結構可以推斷：
+
+1. **License key 本身包含加密資訊**（過期時間、plan 類型等），用**數位簽章**驗證——這不需要聯網
+2. **續約需要聯網**（`renew_license_key` 用 `reqwest::Client`）——離線環境需要手動更新 key
+3. **離線寬限期**——key 中嵌入了過期時間，在過期前不需要聯網驗證
+
+### License Key 的真正格式（從原始碼反推）
+
+雖然驗證邏輯不公開，但 key 的**格式**寫在公開的原始碼裡：
+
+```rust
+// backend/windmill-common/src/instance_config.rs (line ~994)
+
+/// License keys have the format `<client_id>.<expiry>.<signature>`.
+fn license_key_expiry(value: &serde_json::Value) -> Option<u64> {
+    let s = value.as_str()?;
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    parts[1].parse::<u64>().ok()  // 第二段是過期時間戳
+}
+
+/// Returns true if two license key values share the same client ID
+fn license_keys_same_client(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let a_parts: Vec<&str> = a_str.split('.').collect();
+    let b_parts: Vec<&str> = b_str.split('.').collect();
+    // 比較第一段（client_id）
+    a_parts.first() == b_parts.first()
+}
+```
+
+所以 License Key 的格式是：
+
+```
+<client_id>.<expiry_timestamp>.<signature>
+
+例如：
+cust_abc123.1735689600.a1b2c3d4e5f6...
+
+     │           │           │
+     │           │           └── 數位簽章（防偽造）
+     │           └── Unix 時間戳（過期時間，純數字）
+     └── 客戶 ID
+```
+
+### 私有網路如何手動更新 License Key
+
+有**三種方式**可以在離線環境更新 key：
+
+#### 方式 1：透過 Web UI（Superadmin Settings）
+
+```
+瀏覽器 → http://your-windmill:8000/#superadmin-settings
+→ Core 區塊 → License key 欄位 → 貼上新 key → Save
+```
+
+前端的實作：
+
+```typescript
+// frontend/src/lib/components/instanceSettings.ts
+{
+    label: 'License key',
+    description: 'License key required to use the EE (switch image for windmill-ee).',
+    key: 'license_key',
+    fieldType: 'license_key',
+    placeholder: 'only for EE',
+    storage: 'setting'     // 存到 global_settings 表
+}
+```
+
+儲存後，前端呼叫 API → 寫入 PostgreSQL `global_settings` 表 → 觸發 `reload_license_key()`。
+
+#### 方式 2：環境變數
+
+```bash
+# Docker Compose 或 K8s 環境變數
+LICENSE_KEY=cust_abc123.1735689600.a1b2c3d4e5f6...
+```
+
+```rust
+// backend/src/monitor.rs (line ~1882)
+let mut value = std::env::var("LICENSE_KEY")   // 先讀環境變數
+    .ok()
+    .unwrap_or(String::new());
+
+if let Some(q) = q {        // DB 的值會覆蓋環境變數
+    value = v;
+}
+set_license_key(value, conn.as_sql()).await;
+```
+
+優先級：**DB global_settings > 環境變數**。
+
+#### 方式 3：直接寫資料庫
+
+```sql
+-- 最底層的方式，任何環境都能用
+INSERT INTO global_settings (name, value)
+VALUES ('license_key', '"cust_abc123.1735689600.new_signature"')
+ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value;
+```
+
+系統會在背景循環中自動偵測設定變更並 reload：
+
+```rust
+// backend/src/main.rs (line ~1687)
+LICENSE_KEY_SETTING => {
+    if let Err(e) = reload_license_key(&db.into()).await {
+        tracing::error!("Failed to reload license key: {e:#}");
+    }
+    verify_license_key().await;   // 立即驗證新 key
+}
+```
+
+### 離線更新的完整流程
+
+```
+1. 客戶聯絡 Windmill 銷售/支援
+2. Windmill 用私鑰簽發新 key：
+   new_key = "cust_abc123.1767225600.new_signature"
+                          ^^^^^^^^^
+                          新的過期時間（例如延後一年）
+3. 客戶透過以下任一方式更新（不需要網路）：
+   a) Web UI：/#superadmin-settings → 貼上新 key
+   b) 環境變數：修改 docker-compose.yml 的 LICENSE_KEY
+   c) SQL：直接 UPDATE global_settings
+
+4. 系統自動 reload → verify → LICENSE_KEY_VALID = true
+```
+
+### Key 更新時的防護邏輯
+
+系統還會檢查：新 key 的過期時間必須比舊 key **更晚**，防止降級攻擊：
+
+```rust
+// backend/windmill-common/src/instance_config.rs (line ~1120)
+Some(existing) if key == LICENSE_KEY_SETTING => {
+    if license_keys_same_client(existing, &value) {
+        let current_expiry = license_key_expiry(existing).unwrap_or(0);
+        let desired_expiry = license_key_expiry(&value).unwrap_or(0);
+        if desired_expiry > current_expiry {
+            // 新 key 過期時間更晚 → 允許更新
+            upserts.insert(key.clone(), value);
+        } else {
+            // 新 key 過期更早 → 拒絕（防止用舊 key 覆蓋新 key）
+            tracing::info!("Skipping license_key update: desired expiry ({}) \
+                is not posterior to current expiry ({})", desired_expiry, current_expiry);
+        }
+    } else {
+        // 不同客戶的 key → 直接替換（正常的首次設定或更換客戶）
+        upserts.insert(key.clone(), value);
+    }
+}
+```
+
+### 這個模式的架構總結
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 第 1 層：編譯時隔離（最強）                                │
+│                                                         │
+│  GitHub 公開 repo          私有 repo (windmill-ee-private)│
+│  ┌──────────┐              ┌──────────┐                  │
+│  │ ee_oss.rs│   symlink    │ ee.rs    │                  │
+│  │ 空殼函式  │ ←──────────  │ 真正實作  │                  │
+│  │ 永遠 true│              │ 驗證邏輯  │                  │
+│  └──────────┘              └──────────┘                  │
+│                                                         │
+│  cfg(not(feature="private"))  cfg(feature="private")     │
+│  → 用空殼                     → 用真正實作                │
+├─────────────────────────────────────────────────────────┤
+│ 第 2 層：運行時攔截                                       │
+│                                                         │
+│  LICENSE_KEY_VALID = false 時：                           │
+│  ✗ Worker 拒絕處理 job（sleep 10s loop）                  │
+│  ✗ 排程拒絕推入 job                                      │
+│  ✗ API 拒絕執行請求                                      │
+├─────────────────────────────────────────────────────────┤
+│ 第 3 層：License Key 簽章 + 線上續約                       │
+│                                                         │
+│  key 內含數位簽章 → 離線也能驗證真偽                        │
+│  定期線上續約 → 確認帳戶狀態                               │
+│  私有網路 → 靠 key 內建的過期時間 + 離線寬限期               │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 你的產品可以學到什麼
+
+1. **私有 repo 存放核心商業邏輯**——不要把驗證邏輯放在公開 repo
+2. **用 Rust feature flag 做編譯時隔離**——比 runtime check 更安全
+3. **空殼模式（Stub Pattern）**——開源版用空函式，企業版用 symlink 替換
+4. **多點攔截**——API、Worker、Scheduler 都檢查，即使繞過一個也過不了其他的
+5. **數位簽章的 License Key**——離線也能驗證，不依賴聯網
+
+---
+
 ## 結語
 
 Windmill 是一個成熟的產品（544 個 migration、1436 個前端組件、25+ 種語言支援），從零重建它不現實。但你可以：
