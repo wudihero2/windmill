@@ -68,34 +68,46 @@ flowforge/
 │   ├── src/main.rs                # Server + Worker 入口
 │   ├── migrations/                # SQLx migrations
 │   └── crates/
-│       ├── api/src/               # Axum 路由
-│       │   ├── lib.rs             # Router 組裝
-│       │   ├── auth.rs            # JWT middleware
-│       │   ├── scripts.rs         # Script CRUD
-│       │   ├── flows.rs           # Flow CRUD + 版本控制
-│       │   ├── flow_files.rs      # Flow 工作區檔案 CRUD
-│       │   ├── jobs.rs            # Job 執行/查詢
-│       │   └── sse.rs             # SSE 日誌串流
-│       ├── types/src/             # 領域型別
-│       │   ├── scripts.rs         # Script, ScriptLang
-│       │   ├── flows.rs           # FlowValue, FlowModule, InputTransform
-│       │   ├── flow_status.rs     # FlowStatus 狀態機
-│       │   ├── flow_version.rs    # FlowRevision, FlowDiff
-│       │   └── jobs.rs            # Job, JobKind
-│       ├── queue/src/             # Job Queue
-│       │   ├── push.rs            # 推入 job
-│       │   ├── pull.rs            # FOR UPDATE SKIP LOCKED
-│       │   └── complete.rs        # 完成/失敗
-│       ├── worker/src/            # Worker
-│       │   ├── worker.rs          # 主迴圈
-│       │   ├── sandbox.rs         # Sandbox trait + nsjail/k8s 實作
-│       │   ├── python.rs          # Python executor
-│       │   ├── typescript.rs      # TS executor（Phase 4）
-│       │   ├── duckdb.rs          # DuckDB executor（Phase 4）
-│       │   ├── handle_child.rs    # 子程序監控
-│       │   └── flow_engine.rs     # Flow 狀態機
-│       ├── jseval/src/lib.rs      # boa_engine JS 表達式求值
-│       └── object-store/src/      # S3 整合
+│       ├── api/                   # Axum 路由
+│       │   ├── Cargo.toml         # deps: axum, tower, serde, sqlx, jsonwebtoken, argon2
+│       │   └── src/
+│       │       ├── lib.rs             # Router 組裝
+│       │       ├── auth.rs            # JWT middleware
+│       │       ├── scripts.rs         # Script CRUD
+│       │       ├── flows.rs           # Flow CRUD + 版本控制
+│       │       ├── flow_files.rs      # Flow 工作區檔案 CRUD
+│       │       ├── jobs.rs            # Job 執行/查詢
+│       │       └── sse.rs             # SSE 日誌串流
+│       ├── types/                 # 領域型別
+│       │   ├── Cargo.toml         # deps: serde, uuid, chrono
+│       │   └── src/
+│       │       ├── scripts.rs         # Script, ScriptLang
+│       │       ├── flows.rs           # FlowValue, FlowModule, InputTransform
+│       │       ├── flow_status.rs     # FlowStatus 狀態機
+│       │       ├── flow_version.rs    # FlowRevision, FlowDiff
+│       │       └── jobs.rs            # Job, JobKind
+│       ├── queue/                 # Job Queue
+│       │   ├── Cargo.toml         # deps: sqlx, chrono, uuid
+│       │   └── src/
+│       │       ├── push.rs            # 推入 job
+│       │       ├── pull.rs            # FOR UPDATE SKIP LOCKED
+│       │       └── complete.rs        # 完成/失敗
+│       ├── worker/                # Worker
+│       │   ├── Cargo.toml         # deps: tokio, sqlx, opentelemetry, reqwest
+│       │   └── src/
+│       │       ├── worker.rs          # 主迴圈
+│       │       ├── sandbox.rs         # Sandbox trait + nsjail/k8s 實作
+│       │       ├── python.rs          # Python executor
+│       │       ├── typescript.rs      # TS executor（Phase 4）
+│       │       ├── duckdb.rs          # DuckDB executor（Phase 4）
+│       │       ├── handle_child.rs    # 子程序監控
+│       │       └── flow_engine.rs     # Flow 狀態機
+│       ├── jseval/                # boa_engine JS 表達式求值
+│       │   ├── Cargo.toml         # deps: boa_engine, serde_json
+│       │   └── src/lib.rs
+│       └── object-store/          # S3 整合
+│           ├── Cargo.toml         # deps: aws-sdk-s3
+│           └── src/lib.rs
 ├── frontend/
 │   ├── src/
 │   │   ├── routes/
