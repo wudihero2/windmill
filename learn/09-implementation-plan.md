@@ -12,6 +12,7 @@
 - **Day 1 Flow 版本控制**（不可變 revision，可 diff / rollback）
 - **VS Code 風格多檔案編輯器**（多 Python 檔案互相引用，`main` 為入口）
 - **資料引擎即時預覽**（DataPreviewTable 元件）
+- **Resource 系統**（集中管理外部連線/密鑰，使用者程式碼零 SDK 存取）
 
 ---
 
@@ -40,6 +41,8 @@
 | 狀態追蹤 | 單一 status 欄位 | **State History**：完整狀態轉換歷史（學 Prefect） |
 | 事件審計 | 自建 audit log | **Event Log**：通用事件日誌（學 Dagster） |
 | 並發控制 | 無 tag 級限制 | **ConcurrencyLimit**：tag 級並發上限（學 Prefect） |
+| 同步執行 | `run_wait_result`（DB 輪詢） | **同步模式**：NOTIFY 事件驅動 + Early Return + 斷線自動取消 |
+| Resource | `$res:path` 引用 + JSON Schema UI | **Resource 系統**：AES 加密 + `$res:` 引用替換 + 零 SDK 存取 |
 
 ---
 
@@ -77,6 +80,7 @@ flowforge/
 │       │       ├── flows.rs           # Flow CRUD + 版本控制
 │       │       ├── flow_files.rs      # Flow 工作區檔案 CRUD
 │       │       ├── jobs.rs            # Job 執行/查詢
+│       │       ├── resources.rs      # Resource CRUD + 加解密
 │       │       └── sse.rs             # SSE 日誌串流
 │       ├── types/                 # 領域型別
 │       │   ├── Cargo.toml         # deps: serde, uuid, chrono
@@ -97,6 +101,7 @@ flowforge/
 │       │   └── src/
 │       │       ├── worker.rs          # 主迴圈
 │       │       ├── sandbox.rs         # Sandbox trait + nsjail/k8s 實作
+│       │       ├── resolve_args.rs    # $res: / $var: 引用替換
 │       │       ├── python.rs          # Python executor
 │       │       ├── typescript.rs      # TS executor（Phase 4）
 │       │       ├── duckdb.rs          # DuckDB executor（Phase 4）
@@ -116,6 +121,7 @@ flowforge/
 │   │   │   ├── scripts/           # Script 頁面
 │   │   │   ├── flows/             # Flow 頁面
 │   │   │   ├── jobs/              # Job 頁面
+│   │   │   ├── resources/         # Resource 管理頁面
 │   │   │   └── schedules/         # 排程頁面
 │   │   └── lib/
 │   │       ├── components/
@@ -125,7 +131,8 @@ flowforge/
 │   │       │   ├── FlowVersionPanel.svelte # 版本歷史 + diff
 │   │       │   ├── DataPreviewTable.svelte # 資料查詢預覽表格
 │   │       │   ├── LogViewer.svelte      # SSE 即時日誌
-│   │       │   └── ArgInput.svelte       # JSON Schema → 表單
+│   │       │   ├── ArgInput.svelte       # JSON Schema → 表單
+│   │       │   └── ResourceEditor.svelte # Resource 管理 UI
 │   │       ├── gen/                      # OpenAPI 生成
 │   │       └── stores/
 │   └── package.json
@@ -153,7 +160,7 @@ flowforge/
 | **Kestra** | PostgreSQL (JDBC) 或 Kafka | 可選 Kafka | 依 backend |
 | **Windmill** | PostgreSQL `FOR UPDATE SKIP LOCKED` | 無 | ~50ms（polling） |
 
-**我們的選擇：PostgreSQL `FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`**
+**我們的選擇：PostgreSQL `FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY` 雙軌制**
 
 理由：
 1. 已被 Windmill（5000 RPS）和 Dagster 驗證可行
@@ -161,6 +168,28 @@ flowforge/
 3. Job 入隊和元資料在同一個事務中，不會出現「job 已分發但元資料沒寫入」
 4. `LISTEN/NOTIFY` 可以把延遲從 50ms 降到個位數毫秒
 5. Rust + sqlx + Tokio 天然適配
+
+**雙軌制 Worker Pull 策略**：
+
+```
+┌─────────────────────────────────────────────────┐
+│ 主要：LISTEN/NOTIFY 事件驅動                      │
+│   push_job() → NOTIFY new_job                    │
+│   Worker LISTEN new_job → 收到通知 → 立即 pull    │
+│   延遲：~1-5ms                                    │
+│                                                   │
+│ 兜底：長間隔 Polling（每 5 秒）                    │
+│   防止：PG 連線斷開重連、NOTIFY 丟失、             │
+│         scheduled_for 延遲排程的 job               │
+│                                                   │
+│ Job 完成也 NOTIFY（給 run_wait_result 用）：       │
+│   complete_job() → NOTIFY job_completed, '{id}'  │
+│   run_wait_result LISTEN job_completed → 比對 id │
+└─────────────────────────────────────────────────┘
+```
+
+**為什麼 Windmill 沒用 NOTIFY？** Windmill worker 以 50ms 間隔輪詢，高吞吐時幾乎永遠有 job 可拉，NOTIFY 收益不大。
+但 FlowForge 定位支援低延遲同步 API（`run_wait_result`），NOTIFY 把 queue→start 從 ~50ms 降到 ~1-5ms，非常值得。
 
 ### Job 三表分離設計
 
@@ -173,6 +202,41 @@ Windmill v1 把 queue 和結果放同一張表，後來 v2 才分離。我們直
 | `job_completed` | 結果（result, duration, s3_key） | Job 完成時寫入 |
 
 好處：`job_queue` 表永遠很小（只有未完成的 job），`FOR UPDATE SKIP LOCKED` 效能穩定。
+
+### 全域 Worker 並發控制
+
+**問題**：Worker 數量 = 同時跑的 job 數。如果部署太多 Worker 或大量同步請求湧入，可能壓垮 DB / runtime / 外部 API。
+
+**三層防禦**：
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Layer 1：Worker 數量（部署層）                           │
+│   每個程序 config.num_workers = N                       │
+│   → 這台機器最多同時跑 N 個 job                         │
+│   → K8s 部署：HPA 控制 replica 數 × N                  │
+├────────────────────────────────────────────────────────┤
+│ Layer 2：全域並發上限（worker_config 表）                │
+│   max_concurrent_jobs = 50                             │
+│   → 即使有 100 個 Worker，最多 50 個同時跑               │
+│   → pull_job() 檢查 running count，超過就不搶           │
+│   → 多餘的 Worker 空轉等 NOTIFY                        │
+├────────────────────────────────────────────────────────┤
+│ Layer 3：Tag 級並發上限（concurrency_limit 表）          │
+│   tag="gpu" max_concurrent=2                           │
+│   tag="external-api" max_concurrent=5                  │
+│   → pull_job() SQL 中 NOT EXISTS 子查詢過濾              │
+│   → 防止特定類型 job 吃光所有 worker                     │
+├────────────────────────────────────────────────────────┤
+│ Layer 4：同步請求反壓（check_queue_too_long）            │
+│   queue_limit = 100                                    │
+│   → run_wait_result / webhook sync 專用                │
+│   → queue 太長直接 503，防止同步請求堆積                  │
+└────────────────────────────────────────────────────────┘
+```
+
+**Windmill 的做法**：只有 Layer 1（每 worker 跑一個 job，部署幾個 worker = 幾個 slot）+ 部分 Layer 4（`QUEUE_LIMIT_WAIT_RESULT`）。
+我們增加 Layer 2（全域上限）和 Layer 3（tag 級限制），更精細的控制。
 
 ### Sandbox 四模式策略
 
@@ -320,6 +384,92 @@ CREATE TABLE flow_file (
 | Prefect | Labels / Tags 系統 | 現有 tag 系統已足夠 |
 | Dagster | Multi-dimensional Partitions | Phase 1 不需要分區概念 |
 | Airflow | Trigger 非同步延遲模型 | 我們用 suspend / approval 代替 |
+
+### Resource 系統（學習 Windmill Resource + Airflow Connection）
+
+**問題**：使用者寫的 Python 需要連外部服務（DB、API），但不應該把密碼寫死在程式碼裡。需要一個平台級的資源管理系統。
+
+**各平台做法比較**：
+
+| 平台 | 定義 | 存取方式 | 加密 | 使用者體驗 |
+|------|------|---------|------|-----------|
+| Airflow | UI / CLI / env | `Hook.get_connection("id")` SDK 呼叫 | Fernet | 需要 import Airflow |
+| Prefect | Python class + UI | `Block.load("name")` SDK 呼叫 | 全值加密 | 需要 import Prefect |
+| Dagster | Python class in code | **依賴注入**（函數參數） | 無（靠 EnvVar） | 最優雅但無 UI |
+| Kestra | YAML + UI | `{{ secret('KEY') }}` 模板 | AES（Enterprise） | 無型別 |
+| **Windmill** | **UI（JSON Schema 表單）** | **`$res:path` → Worker 替換 → args.json** | 加密存儲 | **零 SDK** |
+
+**我們的選擇：Windmill 模式 + AES 加密**
+
+理由：**使用者的程式碼完全不需要 import 任何 FlowForge SDK**。Worker 在執行前把 `$res:path` 替換成實際值，寫入 `args.json`，使用者的函數收到的就是普通 dict。
+
+```
+資料流：
+  UI 建立 Resource（JSON Schema 表單）
+    → 存 DB（value 用 AES-256-GCM 加密）
+    → Script 參數標 resource type
+    → Flow InputTransform 引用 "$res:u/admin/prod_db"
+    → Worker 執行前 resolve_args()：$res: → 解密 → 替換
+    → 寫 args.json
+    → 使用者的 def main(db: dict) 直接拿到明文 dict
+```
+
+```python
+# 使用者寫的 script —— 完全不知道 FlowForge 的存在
+def main(db: dict, api_key: str):
+    # db = {"host": "prod-pg.example.com", "port": 5432, "password": "s3cret"}
+    import psycopg2
+    conn = psycopg2.connect(**db)
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) FROM users")
+    return {"count": cursor.fetchone()[0]}
+```
+
+### 同步執行模式（學習 Windmill `run_wait_result`）
+
+**使用場景**：把 FlowForge 當作 API 使用——外部系統呼叫 workflow，阻塞等待結果後回傳。
+
+```
+典型情境：貸款系統 → POST /api/w/prod/jobs/run_wait_result/f/credit-scoring
+         → FlowForge 執行信用評分 flow
+         → HTTP 阻塞等待
+         → 200 OK { "score": 720, "approved": true }
+         → 總延遲 < 200ms（Dedicated Worker + 輕量 Python）
+```
+
+**Windmill 做法分析**：
+
+| 機制 | Windmill 實作 | 我們的改進 |
+|------|-------------|-----------|
+| 等待策略 | DB 輪詢（50ms fast → 200ms slow） | **NOTIFY 事件驅動** + 200ms 兜底輪詢 |
+| 斷線處理 | RAII Guard（Drop 時取消 job） | 相同 |
+| 超時 | `TIMEOUT_WAIT_RESULT`（預設 600s） | 相同 |
+| 佇列反壓 | `QUEUE_LIMIT_WAIT_RESULT` | 相同 |
+| 回應格式 | `WindmillCompositeResult`（自訂 status/headers） | 相同 |
+| Flow 部分回傳 | 指定某個 node 的結果作為回傳 | **Early Return**：指定回傳節點，剩餘步驟背景執行 |
+| Webhook 同步 | `RequestType::Sync` | 相同（Phase 3 整合） |
+| 最低延遲 | Dedicated Worker ~12ms 開銷 | Dedicated + Runner Group ~5ms |
+
+**三種執行模式**：
+
+```
+1. Async（預設）：POST /jobs/run/p/{path} → 立即回傳 { id: uuid }
+2. Sync：POST /jobs/run_wait_result/p/{path} → 阻塞等結果 → 回傳 result
+3. Sync SSE：POST /jobs/run_wait_result/p/{path}?sse=true → SSE 串流日誌 + 最終結果
+```
+
+**延遲預估（同步模式）**：
+
+```
+                    Queue   Start   Execute   Total
+Normal Worker:      ~5ms  + ~60ms + exec     ≈ 65ms + exec
+Dedicated Worker:   ~5ms  + ~0ms  + exec     ≈ 5ms + exec
+Runner Group:       ~5ms  + ~0ms  + exec     ≈ 5ms + exec
+
+範例：信用評分 Python（~50ms 推論）
+  Normal:     65 + 50 = ~115ms ✓ 子秒
+  Dedicated:   5 + 50 = ~55ms  ✓ 遠低於 1 秒
+```
 
 ---
 
@@ -503,14 +653,62 @@ CREATE TABLE concurrency_limit (
     PRIMARY KEY (workspace_id, tag)
 );
 
--- === Worker 健康 ===
+-- === Resource（集中管理外部連線 / 密鑰）===
 
+-- Resource 類型定義（JSON Schema 驅動 UI 表單）
+CREATE TABLE resource_type (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    name VARCHAR(100) NOT NULL,           -- "postgres", "openai", "s3", "slack"
+    schema JSONB NOT NULL,                -- JSON Schema（定義此類型有哪些欄位）
+    description TEXT DEFAULT '',
+    PRIMARY KEY (workspace_id, name)
+);
+
+-- Resource 實例（加密存儲）
+CREATE TABLE resource (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    path VARCHAR(255) NOT NULL,           -- "u/admin/prod_db", "f/shared/openai_key"
+    resource_type VARCHAR(100) NOT NULL,  -- FK → resource_type.name
+    value_encrypted BYTEA NOT NULL,       -- AES-256-GCM 加密的 JSONB
+    description TEXT DEFAULT '',
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, path)
+);
+
+-- Variable（簡單 key-value，可被 Resource 引用）
+CREATE TABLE variable (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    path VARCHAR(255) NOT NULL,           -- "u/admin/api_key"
+    value_encrypted BYTEA NOT NULL,       -- AES-256-GCM 加密
+    is_secret BOOLEAN NOT NULL DEFAULT TRUE,
+    description TEXT DEFAULT '',
+    created_by VARCHAR(255) NOT NULL,
+    PRIMARY KEY (workspace_id, path)
+);
+
+-- === Worker 管理 ===
+
+-- 全域 Worker 並發控制
+CREATE TABLE worker_config (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    -- 全域上限：所有 worker 同時跑的 job 總數
+    -- NULL = 不限（由 worker 數量自然限制）
+    max_concurrent_jobs INTEGER,
+    -- 各 tag 上限（與 concurrency_limit 互補，這是全域層級）
+    max_workers_per_tag JSONB DEFAULT '{}',  -- {"gpu": 2, "heavy": 4}
+    PRIMARY KEY (workspace_id)
+);
+
+-- Worker 健康 + 狀態
 CREATE TABLE worker_ping (
     worker VARCHAR(100) PRIMARY KEY,
     ping_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     tags TEXT[] NOT NULL DEFAULT '{}',
     ip VARCHAR(45),
-    sandbox_mode VARCHAR(20)  -- "nsjail", "k8s", "none"
+    sandbox_mode VARCHAR(20),       -- "nsjail", "k8s", "none"
+    current_job_id UUID,            -- 正在跑的 job（NULL = 閒置）
+    jobs_completed INTEGER DEFAULT 0  -- 累計完成數（監控用）
 );
 ```
 
@@ -661,7 +859,7 @@ pub async fn handle_python_job(
 
     write_file(job_dir, "inner.py", content)?;
     write_file(job_dir, "wrapper.py", &generate_python_wrapper())?;
-    create_args_and_out_file(job, job_dir).await?;
+    create_args_and_out_file(job, job_dir, db, &state.encryption_key).await?;
 
     let ctx = SandboxContext {
         job_id: job.id,
@@ -733,19 +931,44 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
 
 // crates/queue/src/pull.rs
 
-/// FOR UPDATE SKIP LOCKED — 搶 job
+/// FOR UPDATE SKIP LOCKED — 搶 job（含全域並發控制）
 pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result<Option<PulledJob>> {
+    // 1. 檢查全域並發上限
+    //    running_count = job_queue 中 running=TRUE 的數量
+    //    如果超過 max_concurrent_jobs，不搶（讓 Worker 閒置等待）
+    let global_limit = sqlx::query_scalar!(
+        "SELECT max_concurrent_jobs FROM worker_config LIMIT 1"
+    ).fetch_optional(db).await?.flatten();
+
+    if let Some(limit) = global_limit {
+        let running: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM job_queue WHERE running = TRUE"
+        ).fetch_one(db).await?.unwrap_or(0);
+
+        if running >= limit as i64 {
+            return Ok(None); // 全域已滿，等下一輪
+        }
+    }
+
+    // 2. 同時檢查 tag 級並發上限（ConcurrencyLimit 表）
     let row = sqlx::query_as!(PulledJob,
         r#"
         WITH next_job AS (
-            SELECT jq.id
+            SELECT jq.id, jq.tag
             FROM job_queue jq
             WHERE jq.running = FALSE
               AND jq.scheduled_for <= now()
               AND jq.tag = ANY($1)
+              -- tag 級並發控制：跳過已達上限的 tag
+              AND NOT EXISTS (
+                  SELECT 1 FROM concurrency_limit cl
+                  WHERE cl.tag = jq.tag
+                    AND (SELECT COUNT(*) FROM job_queue jq2
+                         WHERE jq2.tag = jq.tag AND jq2.running = TRUE) >= cl.max_concurrent
+              )
             ORDER BY jq.priority DESC, jq.scheduled_for ASC
             LIMIT 1
-            FOR UPDATE SKIP LOCKED
+            FOR UPDATE OF jq SKIP LOCKED
         )
         UPDATE job_queue
         SET running = TRUE, started_at = now(), worker = $2, last_ping = now()
@@ -759,27 +982,17 @@ pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result
     .await?;
 
     if let Some(row) = row {
+        // 更新 worker_ping 記錄正在跑的 job
+        sqlx::query!(
+            "UPDATE worker_ping SET current_job_id = $1 WHERE worker = $2",
+            row.id, worker_name
+        ).execute(db).await.ok();
+
         let job = sqlx::query_as!(QueuedJob, "SELECT * FROM job WHERE id = $1", row.id)
             .fetch_one(db).await?;
         Ok(Some(PulledJob { job, tag: row.tag }))
     } else {
         Ok(None)
-    }
-}
-
-/// LISTEN/NOTIFY 增強版 pull（近零延遲）
-async fn pull_with_notify(db: &PgPool, worker: &str, tags: &[String]) -> Result<Option<Job>> {
-    let mut listener = sqlx::postgres::PgListener::connect_with(&db).await?;
-    listener.listen("new_job").await?;
-
-    loop {
-        if let Some(job) = pull_job(db, worker, tags).await? {
-            return Ok(Some(job));
-        }
-        tokio::select! {
-            _ = listener.recv() => { /* 收到通知，立即重試 */ }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => { /* 安全兜底 */ }
-        }
     }
 }
 
@@ -802,6 +1015,18 @@ pub async fn complete_job(
 
     sqlx::query!("DELETE FROM job_queue WHERE id = $1", job_id)
         .execute(&mut *tx).await?;
+
+    // NOTIFY：喚醒 run_wait_result 的輪詢（把 200ms 延遲降到 ~1ms）
+    sqlx::query("SELECT pg_notify('job_completed', $1)")
+        .bind(job_id.to_string())
+        .execute(&mut *tx).await?;
+
+    // 清除 worker 的 current_job_id + 累計完成數
+    sqlx::query!(
+        "UPDATE worker_ping SET current_job_id = NULL, jobs_completed = jobs_completed + 1
+         WHERE current_job_id = $1", job_id
+    ).execute(&mut *tx).await.ok();
+
     tx.commit().await?;
     Ok(())
 }
@@ -837,7 +1062,12 @@ pub async fn run_worker(
         }
     });
 
+    // 雙軌 Pull：LISTEN/NOTIFY 事件驅動 + 5 秒兜底輪詢
+    let mut listener = sqlx::postgres::PgListener::connect_with(&db).await.unwrap();
+    listener.listen("new_job").await.unwrap();
+
     loop {
+        // 先嘗試拉 job
         match queue::pull_job(&db, &worker_name, &tags).await {
             Ok(Some(pulled)) => {
                 let job = pulled.job;
@@ -879,8 +1109,30 @@ pub async fn run_worker(
                 if let Some(parent_job) = job.parent_job {
                     update_flow_after_job_completion(&db, parent_job, job.id).await.ok();
                 }
+
+                continue; // 立即嘗試拉下一個 job（不等待）
             }
-            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+            Ok(None) => {
+                // 沒有 job → 等 NOTIFY 或 5 秒兜底
+                tokio::select! {
+                    notification = listener.recv() => {
+                        match notification {
+                            Ok(_) => {} // 收到 new_job 通知，立即回到 loop 拉 job
+                            Err(e) => {
+                                tracing::warn!("PG LISTEN error, reconnecting: {:?}", e);
+                                if let Ok(new_listener) = sqlx::postgres::PgListener::connect_with(&db).await {
+                                    listener = new_listener;
+                                    listener.listen("new_job").await.ok();
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        // 兜底輪詢：處理 scheduled_for 延遲排程、NOTIFY 漏掉等邊界
+                    }
+                }
+            }
             Err(e) => {
                 tracing::error!("Error pulling job: {:?}", e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -968,15 +1220,34 @@ pub fn create_router(db: PgPool, sandbox: Arc<SandboxRouter>) -> Router {
             // Flow 工作區檔案（Phase 2）
             .route("/flows/files/p/*path", get(flow_files::list_flow_files).put(flow_files::upsert_flow_file))
             .route("/flows/files/p/*path/f/*file_path", get(flow_files::get_flow_file).delete(flow_files::delete_flow_file))
-            // Jobs
+            // Jobs — 非同步（立即回傳 job id）
             .route("/jobs/run/p/*path", post(jobs::run_script_by_path))
             .route("/jobs/run/f/*path", post(jobs::run_flow))
             .route("/jobs/run/preview", post(jobs::run_preview))
+            // Jobs — 同步（阻塞等結果回傳）
+            .route("/jobs/run_wait_result/p/*path", post(jobs::run_wait_result_script))
+            .route("/jobs/run_wait_result/f/*path", post(jobs::run_wait_result_flow))
+            .route("/jobs/run_wait_result/preview", post(jobs::run_wait_result_preview))
+            // Jobs — 查詢
             .route("/jobs/:id", get(jobs::get_job))
             .route("/jobs/:id/result", get(jobs::get_job_result))
             .route("/jobs/:id/logs", get(sse::stream_job_logs))
             .route("/jobs/:id/flow_status", get(jobs::get_flow_status))
             .route("/jobs/list", get(jobs::list_jobs))
+            // Resources
+            .route("/resources/types", get(resources::list_types).post(resources::create_type))
+            .route("/resources/list", get(resources::list_resources))
+            .route("/resources/get/p/*path", get(resources::get_resource))
+            .route("/resources/get_value/p/*path", get(resources::get_resource_value))
+            .route("/resources/create", post(resources::create_resource))
+            .route("/resources/update/p/*path", put(resources::update_resource))
+            .route("/resources/delete/p/*path", delete(resources::delete_resource))
+            // Variables
+            .route("/variables/list", get(resources::list_variables))
+            .route("/variables/get/p/*path", get(resources::get_variable))
+            .route("/variables/create", post(resources::create_variable))
+            .route("/variables/update/p/*path", put(resources::update_variable))
+            .route("/variables/delete/p/*path", delete(resources::delete_variable))
             // Data Preview（Phase 4）
             .route("/data/preview", post(data_preview::preview_query))
             // Concurrency Limits（Phase 3）
@@ -1123,6 +1394,223 @@ pub async fn run_preview(
     }).await?;
 
     Ok(Json(JobCreated { id: job_id }))
+}
+```
+
+#### 同步執行（`run_wait_result`）
+
+外部系統把 FlowForge 當 API 用的核心端點——HTTP 阻塞直到 job 完成，直接回傳結果。
+
+```rust
+// crates/api/src/jobs.rs
+
+/// POST /api/w/{ws}/jobs/run_wait_result/p/{path}
+/// 推入 job → 阻塞等完成 → 回傳結果（或超時）
+pub async fn run_wait_result_script(
+    State(state): State<AppState>,
+    Path((workspace_id, path)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+    Query(params): Query<WaitResultParams>,
+    Json(args): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    // 佇列反壓：防止大量同步呼叫擠爆 queue
+    check_queue_too_long(&state.db, params.queue_limit).await?;
+
+    let script = sqlx::query_as!(Script,
+        "SELECT * FROM script WHERE workspace_id = $1 AND path = $2
+         ORDER BY created_at DESC LIMIT 1",
+        workspace_id, path
+    ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+    let job_id = queue::push_job(&state.db, PushJobArgs {
+        workspace_id: &workspace_id,
+        kind: JobKind::Script,
+        script_hash: Some(&script.hash),
+        script_path: Some(&script.path),
+        language: Some(script.language),
+        args: Some(args),
+        tag: "default",
+        created_by: &user.email,
+        ..Default::default()
+    }).await?;
+
+    run_wait_result_internal(&state.db, &workspace_id, job_id, params.timeout, None).await
+}
+
+#[derive(Deserialize)]
+pub struct WaitResultParams {
+    pub timeout: Option<u64>,        // 秒，預設 600
+    pub queue_limit: Option<i64>,    // 佇列上限，超過直接 503
+}
+
+/// 核心：NOTIFY 事件驅動 + 兜底輪詢，等待 job 完成
+///
+/// 與 Worker 的雙軌制對稱：
+///   Worker pull：  LISTEN new_job + 5s 兜底
+///   Wait result：  LISTEN job_completed + 200ms 兜底
+async fn run_wait_result_internal(
+    db: &PgPool, workspace_id: &str, job_id: Uuid,
+    timeout_override: Option<u64>,
+    early_return_node: Option<&str>,  // Flow 的 early return 節點 ID
+) -> Result<Response, ApiError> {
+    // RAII Guard：HTTP 連線斷開時自動取消 job
+    let mut guard = WaitResultGuard { done: false, id: job_id, db: db.clone(), w_id: workspace_id.to_string() };
+
+    let timeout_secs = timeout_override.unwrap_or(600);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    // 主要：LISTEN job_completed（complete_job 會 NOTIFY）
+    let mut listener = sqlx::postgres::PgListener::connect_with(db).await?;
+    listener.listen("job_completed").await?;
+
+    // 兜底輪詢間隔
+    const POLL_INTERVAL_MS: u64 = 200;
+
+    loop {
+        // 查詢完成結果
+        let row = sqlx::query!(
+            "SELECT result, success FROM job_completed
+             WHERE id = $1 AND workspace_id = $2",
+            job_id, workspace_id
+        ).fetch_optional(db).await?;
+
+        if let Some(r) = row {
+            guard.done = true;
+            return result_to_response(r.success, r.result);
+        }
+
+        // 如果是 Flow + early_return，檢查指定節點是否已完成
+        if let Some(node_id) = early_return_node {
+            if let Some(result) = check_early_return(db, workspace_id, job_id, node_id).await? {
+                guard.done = true;  // 不取消 job，讓剩餘步驟背景跑完
+                return result_to_response(true, Some(result));
+            }
+        }
+
+        // 超時檢查
+        if tokio::time::Instant::now() >= deadline {
+            guard.done = true;
+            return Err(ApiError::Timeout(format!("timeout after {}s", timeout_secs)));
+        }
+
+        // 等待：NOTIFY 喚醒（~1ms）或兜底輪詢（200ms）
+        tokio::select! {
+            notification = listener.recv() => {
+                if let Ok(n) = notification {
+                    // 只處理自己的 job_id 的通知
+                    if n.payload() == job_id.to_string() {
+                        continue; // 立即查詢結果
+                    }
+                }
+                // 其他 job 的通知，忽略，繼續等
+            }
+            _ = tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)) => {
+                // 兜底：處理 NOTIFY 漏掉、listener 斷線等邊界
+            }
+        }
+    }
+}
+
+/// 檢查 Flow 的特定節點是否已完成（用於 Early Return）
+async fn check_early_return(
+    db: &PgPool, workspace_id: &str, flow_job_id: Uuid, node_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let status = sqlx::query_scalar!(
+        "SELECT flow_status FROM job_flow_status WHERE id = $1", flow_job_id
+    ).fetch_optional(db).await?;
+
+    if let Some(status_json) = status {
+        let status: FlowStatus = serde_json::from_value(status_json)?;
+        for module in &status.modules {
+            if let FlowStatusModule::Success { id, result, .. } = module {
+                if id == node_id {
+                    return Ok(Some(result.clone()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// RAII Guard：HTTP 連線斷開時自動取消尚未完成的 job
+struct WaitResultGuard {
+    done: bool,
+    id: Uuid,
+    db: PgPool,
+    w_id: String,
+}
+
+impl Drop for WaitResultGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            let id = self.id;
+            let db = self.db.clone();
+            let w_id = self.w_id.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query!(
+                    "UPDATE job_queue SET canceled_by = 'http_disconnect', canceled_reason = 'client disconnected'
+                     WHERE id = $1 AND workspace_id = $2",
+                    id, w_id
+                ).execute(&db).await;
+            });
+        }
+    }
+}
+
+/// 佇列反壓：同步呼叫過多時拒絕新請求
+async fn check_queue_too_long(db: &PgPool, limit: Option<i64>) -> Result<(), ApiError> {
+    if let Some(limit) = limit {
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM job_queue WHERE canceled_by IS NULL AND scheduled_for <= NOW()"
+        ).fetch_one(db).await?.unwrap_or(0);
+
+        if count > limit {
+            return Err(ApiError::ServiceUnavailable(
+                format!("queue too long: {} > {} (try again later)", count, limit)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 將 job 結果轉成 HTTP Response（支援自訂 status code / content-type / headers）
+fn result_to_response(success: bool, result: Option<serde_json::Value>) -> Result<Response, ApiError> {
+    let result = result.unwrap_or(serde_json::Value::Null);
+
+    // 支援 WindmillCompositeResult 格式：script 可以控制 HTTP 回應
+    // { "windmill_status_code": 201, "windmill_content_type": "text/plain",
+    //   "windmill_headers": {"X-Custom": "val"}, "result": { ... } }
+    if let Some(obj) = result.as_object() {
+        if obj.contains_key("windmill_status_code") || obj.contains_key("windmill_content_type") {
+            let status = obj.get("windmill_status_code")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if success { 200 } else { 500 }) as u16;
+            let content_type = obj.get("windmill_content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/json");
+            let body = obj.get("result").unwrap_or(&result);
+
+            let mut response = Response::builder()
+                .status(status)
+                .header("content-type", content_type);
+
+            if let Some(headers) = obj.get("windmill_headers").and_then(|v| v.as_object()) {
+                for (k, v) in headers {
+                    if let Some(v_str) = v.as_str() {
+                        response = response.header(k.as_str(), v_str);
+                    }
+                }
+            }
+
+            return Ok(response.body(serde_json::to_string(body)?.into())?);
+        }
+    }
+
+    let status = if success { 200 } else { 500 };
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&result)?.into())?)
 }
 ```
 
@@ -1422,6 +1910,10 @@ npm run dev  # http://localhost:5173
 3. 同時 Run 多個 job → 確認 queue 用 FOR UPDATE SKIP LOCKED 正常分配
 4. 設定 tag="k8s" → 確認 job 走 K8s Pod 執行
 5. Jaeger UI → 確認 trace 有 job span
+6. 同步執行：POST run_wait_result/p/{path} → 阻塞 → 拿到結果 JSON（不用再查 job id）
+7. 同步超時：設 timeout=1 + 放一個 sleep(5) script → 確認收到 timeout 錯誤
+8. 斷線取消：curl 發 run_wait_result 後 Ctrl+C → 確認 job 被 canceled_by='http_disconnect'
+9. 佇列反壓：設 queue_limit=2 → 同時發 5 個 sync 請求 → 後 3 個收到 503
 ```
 
 ---
@@ -1456,6 +1948,7 @@ pub struct FlowModule {
     pub retry: Option<Retry>,
     pub sleep: Option<InputTransform>,
     pub summary: Option<String>,
+    pub early_return: Option<EarlyReturn>,  // 同步模式下此節點完成即回傳 HTTP
 }
 
 /// 步驟類型
@@ -1534,6 +2027,13 @@ pub struct RetryExponential {
     pub multiplier: u32,
     pub seconds: u32,
     pub random_factor: Option<f64>,
+}
+
+/// 同步執行時的 Early Return 設定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarlyReturn {
+    /// 此節點完成後立即回傳 HTTP 回應，剩餘步驟背景繼續執行
+    pub enabled: bool,
 }
 ```
 
@@ -2224,11 +2724,115 @@ fn serde_json_to_js_value(val: &serde_json::Value, ctx: &mut Context) -> Result<
   </div>
   {#if diffResult}
     <div class="diff-view">
-      <h4>Diff: v{diffResult.from} → v{diffResult.to}</h4>
-      <pre>{JSON.stringify(diffResult.changes, null, 2)}</pre>
+      <div class="diff-header">
+        <h4>Diff: v{diffResult.from} → v{diffResult.to}</h4>
+        <div class="diff-mode-toggle">
+          <button class:active={diffMode === 'side'} onclick={() => diffMode = 'side'}>Side by Side</button>
+          <button class:active={diffMode === 'unified'} onclick={() => diffMode = 'unified'}>Unified</button>
+          <button class:active={diffMode === 'dag'} onclick={() => diffMode = 'dag'}>DAG Diff</button>
+        </div>
+      </div>
+
+      {#if diffMode === 'side'}
+        <!-- Side-by-side：像 GitHub PR 的左右對照 -->
+        <div class="side-by-side">
+          <div class="diff-panel old">
+            <div class="panel-header">v{diffResult.from}</div>
+            {#each diffResult.changes as change}
+              <div class="diff-line" class:removed={change.type === 'removed'} class:modified={change.type === 'modified'}>
+                <span class="path">{change.path}</span>
+                <pre class="value">{JSON.stringify(change.old_value, null, 2)}</pre>
+              </div>
+            {/each}
+          </div>
+          <div class="diff-panel new">
+            <div class="panel-header">v{diffResult.to}</div>
+            {#each diffResult.changes as change}
+              <div class="diff-line" class:added={change.type === 'added'} class:modified={change.type === 'modified'}>
+                <span class="path">{change.path}</span>
+                <pre class="value">{JSON.stringify(change.new_value, null, 2)}</pre>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {:else if diffMode === 'unified'}
+        <!-- Unified：單欄 +/- 顯示 -->
+        <div class="unified-diff">
+          {#each diffResult.changes as change}
+            {#if change.type === 'removed'}
+              <div class="diff-line removed">- {change.path}: {JSON.stringify(change.old_value)}</div>
+            {:else if change.type === 'added'}
+              <div class="diff-line added">+ {change.path}: {JSON.stringify(change.new_value)}</div>
+            {:else if change.type === 'modified'}
+              <div class="diff-line removed">- {change.path}: {JSON.stringify(change.old_value)}</div>
+              <div class="diff-line added">+ {change.path}: {JSON.stringify(change.new_value)}</div>
+            {/if}
+          {/each}
+        </div>
+      {:else}
+        <!-- DAG Diff：視覺化顯示哪些步驟被新增/刪除/修改 -->
+        <div class="dag-diff">
+          {#each diffResult.module_changes as mod}
+            <div class="module-change" class:added={mod.type === 'added'}
+              class:removed={mod.type === 'removed'} class:modified={mod.type === 'modified'}>
+              <span class="module-id">{mod.id}</span>
+              <span class="module-type">{mod.type}</span>
+              {#if mod.type === 'modified'}
+                <span class="module-detail">{mod.changed_fields.join(', ')}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
+
+<style>
+  .diff-mode-toggle { display: flex; gap: 4px; }
+  .diff-mode-toggle button { padding: 4px 8px; border: 1px solid #555; background: #2d2d2d; color: #ccc; cursor: pointer; }
+  .diff-mode-toggle button.active { background: #007acc; color: #fff; }
+  .side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #333; }
+  .diff-panel { background: #1e1e1e; padding: 8px; overflow-x: auto; }
+  .panel-header { font-weight: bold; padding: 4px 0; border-bottom: 1px solid #444; margin-bottom: 8px; }
+  .diff-line.removed { background: rgba(244, 71, 71, 0.15); }
+  .diff-line.added { background: rgba(78, 201, 176, 0.15); }
+  .diff-line.modified { background: rgba(220, 220, 100, 0.15); }
+  .path { color: #888; font-size: 12px; }
+  .module-change { display: flex; gap: 8px; padding: 6px; border-bottom: 1px solid #333; }
+  .module-change.added { border-left: 3px solid #4ec9b0; }
+  .module-change.removed { border-left: 3px solid #f44747; }
+  .module-change.modified { border-left: 3px solid #dcdcaa; }
+</style>
+```
+
+**Diff 後端 API 回傳結構**（支援三種 diff 模式）：
+
+```rust
+#[derive(Serialize)]
+pub struct FlowDiff {
+    pub from: i32,
+    pub to: i32,
+    /// JSON path 級別的變更（用於 side-by-side 和 unified 模式）
+    pub changes: Vec<DiffChange>,
+    /// 模組級別的變更（用於 DAG diff 模式）
+    pub module_changes: Vec<ModuleChange>,
+}
+
+#[derive(Serialize)]
+pub struct DiffChange {
+    pub path: String,              // e.g. "modules[1].value.content"
+    pub r#type: String,            // "added", "removed", "modified"
+    pub old_value: Option<serde_json::Value>,
+    pub new_value: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct ModuleChange {
+    pub id: String,                // e.g. "b"
+    pub r#type: String,            // "added", "removed", "modified", "unchanged"
+    pub changed_fields: Vec<String>, // e.g. ["content", "input_transforms.url"]
+}
 ```
 
 ### 2.6 Flow 版本控制 API
@@ -2455,6 +3059,12 @@ GET    /api/w/{ws}/jobs/{id}/flow_status                // 查詢 flow 執行狀
    - 建立 flow + 3 個檔案（main.py, utils/helpers.py, config.json）
    - main.py 中 `from utils.helpers import clean_data` → 執行成功
    - 前端檔案樹顯示正確的目錄結構
+
+7. Early Return（同步執行 Flow）：
+   - 建立 3 步驟 Flow：A(推論 50ms) → B(存 DB 200ms) → C(寄通知 500ms)
+   - Step A 設 `early_return: { enabled: true }`
+   - POST run_wait_result/f/{path} → Step A 完成即回傳結果（~55ms）
+   - 確認 Step B, C 在背景繼續完成
 ```
 
 ---
@@ -2839,7 +3449,417 @@ if let Some(interval) = schedule.data_interval_seconds {
 
 **用途**：ETL 管線中，Python 程式碼可以直接用 `data_interval_start` 查詢「這批」資料，而不需要自己算時間。
 
-### 3.7 驗證方式
+### 3.7 Resource 系統實作
+
+Schema 在 Phase 1 已建立（`resource_type`, `resource`, `variable` 三表），此處實作完整功能。
+
+#### 加密模組
+
+```rust
+// crates/worker/src/crypto.rs
+
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, OsRng}};
+use aes_gcm::aead::rand_core::RngCore;
+
+/// 加密 resource/variable 的值
+pub fn encrypt_value(plaintext: &serde_json::Value, key: &[u8; 32]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let json_bytes = serde_json::to_vec(plaintext).unwrap();
+    let ciphertext = cipher.encrypt(nonce, json_bytes.as_ref()).unwrap();
+
+    // 格式：nonce(12) + ciphertext
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+    result
+}
+
+pub fn decrypt_value(encrypted: &[u8], key: &[u8; 32]) -> serde_json::Value {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let (nonce_bytes, ciphertext) = encrypted.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext = cipher.decrypt(nonce, ciphertext).unwrap();
+    serde_json::from_slice(&plaintext).unwrap()
+}
+```
+
+#### Resource CRUD API
+
+```rust
+// crates/api/src/resources.rs
+
+pub async fn create_resource(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<CreateResourceRequest>,
+) -> Result<Json<()>, ApiError> {
+    // 驗證 resource_type 的 JSON Schema
+    let rt = sqlx::query_as!(ResourceType,
+        "SELECT schema FROM resource_type WHERE workspace_id = $1 AND name = $2",
+        workspace_id, req.resource_type
+    ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+    validate_json_schema(&rt.schema, &req.value)?;
+
+    // AES-256-GCM 加密
+    let encrypted = crypto::encrypt_value(&req.value, &state.encryption_key);
+
+    sqlx::query!(
+        "INSERT INTO resource (workspace_id, path, resource_type, value_encrypted, description, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+        workspace_id, req.path, req.resource_type, encrypted, req.description, user.email
+    ).execute(&state.db).await?;
+
+    Ok(Json(()))
+}
+
+/// GET /resources/get_value/p/{path}
+/// Worker 呼叫此端點取得解密後的值（僅限內部）
+pub async fn get_resource_value(
+    State(state): State<AppState>,
+    Path((workspace_id, path)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let resource = sqlx::query!(
+        "SELECT value_encrypted FROM resource WHERE workspace_id = $1 AND path = $2",
+        workspace_id, path
+    ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+    let value = crypto::decrypt_value(&resource.value_encrypted, &state.encryption_key);
+    Ok(Json(value))
+}
+```
+
+#### Worker Args 引用替換
+
+核心：Worker 執行 job 前，遞迴遍歷 `args` JSON，把 `$res:path` 和 `$var:path` 替換成實際值。
+
+```rust
+// crates/worker/src/resolve_args.rs
+
+/// 遞迴解析 job args 中的 $res: 和 $var: 引用
+pub async fn resolve_args(
+    args: &mut serde_json::Value,
+    db: &PgPool,
+    workspace_id: &str,
+    encryption_key: &[u8; 32],
+) -> Result<()> {
+    match args {
+        serde_json::Value::String(s) => {
+            if let Some(res_path) = s.strip_prefix("$res:") {
+                // $res:u/admin/prod_db → 從 resource 表取值、解密
+                let resource = sqlx::query!(
+                    "SELECT value_encrypted FROM resource WHERE workspace_id = $1 AND path = $2",
+                    workspace_id, res_path
+                ).fetch_optional(db).await?.ok_or(Error::ResourceNotFound(res_path.into()))?;
+
+                let mut value = crypto::decrypt_value(&resource.value_encrypted, encryption_key);
+                // 遞迴：resource 值內部也可能有 $var: 引用
+                resolve_args(&mut value, db, workspace_id, encryption_key).await?;
+                *args = value;
+            } else if let Some(var_path) = s.strip_prefix("$var:") {
+                // $var:u/admin/api_key → 從 variable 表取值、解密
+                let variable = sqlx::query!(
+                    "SELECT value_encrypted FROM variable WHERE workspace_id = $1 AND path = $2",
+                    workspace_id, var_path
+                ).fetch_optional(db).await?.ok_or(Error::VariableNotFound(var_path.into()))?;
+
+                *args = crypto::decrypt_value(&variable.value_encrypted, encryption_key);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                Box::pin(resolve_args(v, db, workspace_id, encryption_key)).await?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                Box::pin(resolve_args(v, db, workspace_id, encryption_key)).await?;
+            }
+        }
+        _ => {} // Number, Bool, Null — 不處理
+    }
+    Ok(())
+}
+```
+
+#### Worker 整合
+
+`create_args_and_out_file` 中呼叫 `resolve_args`：
+
+```rust
+// crates/worker/src/common.rs（修改既有函數）
+
+pub async fn create_args_and_out_file(
+    job: &QueuedJob, job_dir: &str, db: &PgPool, encryption_key: &[u8; 32],
+) -> Result<()> {
+    let mut args = job.args.clone().unwrap_or(serde_json::json!({}));
+
+    // ★ 核心：解析 $res: 和 $var: 引用
+    resolve_args(&mut args, db, &job.workspace_id, encryption_key).await?;
+
+    // 寫入 args.json（使用者的 wrapper.py 會讀這個檔案）
+    let args_str = serde_json::to_string(&args)?;
+    tokio::fs::write(format!("{}/args.json", job_dir), args_str).await?;
+    tokio::fs::write(format!("{}/result.json", job_dir), "{}").await?;
+    Ok(())
+}
+```
+
+#### 前端 Resource 管理
+
+```
+/resources 頁面：
+  ├── 左側：Resource 列表（按 type 篩選 + 搜尋）
+  ├── 右側：Resource 編輯器
+  │   ├── 選擇 resource_type → 自動生成 JSON Schema 表單
+  │   ├── 密碼欄位顯示 ●●●●●●（不回傳明文到前端）
+  │   └── 測試連線按鈕（可選）
+  └── Resource Type 管理：建立自訂類型 + JSON Schema 編輯器
+
+Script Editor 整合：
+  ├── 參數欄位旁邊有「Link Resource」按鈕
+  └── 選擇 resource → 自動填入 "$res:u/admin/prod_db"
+```
+
+#### 內建 Resource Type
+
+```sql
+-- 預設 resource type（初次啟動自動建立）
+INSERT INTO resource_type (workspace_id, name, schema, description) VALUES
+('admins', 'postgres', '{
+    "type": "object",
+    "properties": {
+        "host": {"type": "string"},
+        "port": {"type": "integer", "default": 5432},
+        "dbname": {"type": "string"},
+        "user": {"type": "string"},
+        "password": {"type": "string"}
+    },
+    "required": ["host", "dbname", "user", "password"]
+}', 'PostgreSQL connection'),
+('admins', 'mysql', '...', 'MySQL connection'),
+('admins', 'openai', '{
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string"},
+        "organization": {"type": "string"}
+    },
+    "required": ["api_key"]
+}', 'OpenAI API credentials'),
+('admins', 's3', '{
+    "type": "object",
+    "properties": {
+        "endpoint": {"type": "string"},
+        "region": {"type": "string"},
+        "access_key_id": {"type": "string"},
+        "secret_access_key": {"type": "string"},
+        "bucket": {"type": "string"}
+    },
+    "required": ["access_key_id", "secret_access_key", "bucket"]
+}', 'S3-compatible storage');
+```
+
+### 3.8 Webhook Trigger + Trigger Trait 框架
+
+**現狀問題**：目前只有 Cron 排程，沒有辦法從外部事件觸發 Flow/Script。Webhook 是最基本的觸發方式——外部系統 POST 一個 HTTP 請求就啟動 job。
+
+**設計原則**：用 Trigger trait 抽象，Phase 3 先實作 Webhook + Cron 兩種，未來（Phase 4+）再接 Kafka、MQTT 等，只需實作 trait 即可。
+
+#### Schema
+
+```sql
+CREATE TABLE webhook_trigger (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    path VARCHAR(255) NOT NULL,          -- trigger 的識別路徑
+    target_type VARCHAR(10) NOT NULL,    -- "script" 或 "flow"
+    target_path VARCHAR(255) NOT NULL,   -- 要觸發的 script/flow path
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    -- 認證方式
+    auth_method VARCHAR(20) NOT NULL DEFAULT 'token',  -- token, hmac, none
+    auth_token_hash CHAR(64),            -- SHA256 of bearer token
+    hmac_secret VARCHAR(255),            -- for HMAC-SHA256 signature verification
+    -- 執行模式
+    request_type VARCHAR(10) NOT NULL DEFAULT 'async',  -- async, sync, sse
+    sync_timeout_secs INTEGER DEFAULT 60,               -- sync 模式超時
+    -- 其他
+    args_transform TEXT,                 -- JS 表達式：將 HTTP body 轉成 job args
+    created_by VARCHAR(255) NOT NULL,
+    PRIMARY KEY (workspace_id, path)
+);
+```
+
+#### Trigger Trait
+
+```rust
+// crates/worker/src/trigger.rs
+
+#[async_trait]
+pub trait Trigger: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// 啟動監聽（長期執行的 background task）
+    async fn start(&self, db: PgPool, handler: Arc<TriggerHandler>) -> Result<()>;
+
+    /// 健康檢查
+    async fn health_check(&self) -> Result<()>;
+}
+
+/// 所有 trigger 共用的處理邏輯：收到事件 → push job
+pub struct TriggerHandler {
+    db: PgPool,
+}
+
+impl TriggerHandler {
+    pub async fn fire(
+        &self, workspace_id: &str, target_type: &str, target_path: &str,
+        args: serde_json::Value, trigger_kind: &str,
+    ) -> Result<Uuid> {
+        let kind = match target_type {
+            "script" => JobKind::Script,
+            "flow" => JobKind::Flow,
+            _ => return Err(Error::BadRequest("invalid target_type")),
+        };
+        queue::push_job(&self.db, PushJobArgs {
+            workspace_id, kind,
+            script_path: if target_type == "script" { Some(target_path) } else { None },
+            flow_path: if target_type == "flow" { Some(target_path) } else { None },
+            args: Some(args),
+            created_by: &format!("trigger:{}", trigger_kind),
+            ..Default::default()
+        }).await
+    }
+}
+```
+
+#### Webhook 實作
+
+```rust
+// crates/api/src/webhooks.rs
+
+/// Webhook 支援三種執行模式
+#[derive(Deserialize, Default)]
+pub enum RequestType { #[default] Async, Sync, SyncSse }
+
+/// POST /api/w/{ws}/webhooks/{path}?mode=sync
+/// 外部系統呼叫此 endpoint 觸發 job
+pub async fn handle_webhook(
+    State(state): State<AppState>,
+    Path((workspace_id, webhook_path)): Path<(String, String)>,
+    Query(params): Query<WebhookQueryParams>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let trigger = sqlx::query_as!(WebhookTrigger,
+        "SELECT * FROM webhook_trigger
+         WHERE workspace_id = $1 AND path = $2 AND enabled = TRUE",
+        workspace_id, webhook_path
+    ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+    // 驗證認證
+    match trigger.auth_method.as_str() {
+        "token" => {
+            let token = headers.get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .ok_or(ApiError::Unauthorized)?;
+            let hash = sha256(token);
+            if hash != trigger.auth_token_hash.unwrap_or_default() {
+                return Err(ApiError::Unauthorized);
+            }
+        }
+        "hmac" => {
+            let signature = headers.get("X-Signature-256")
+                .and_then(|v| v.to_str().ok())
+                .ok_or(ApiError::Unauthorized)?;
+            verify_hmac_sha256(&trigger.hmac_secret.unwrap(), &body, signature)?;
+        }
+        "none" => {} // 公開 webhook
+        _ => return Err(ApiError::BadRequest("unknown auth method")),
+    }
+
+    // 轉換 args（可選的 JS 表達式）
+    let args = if let Some(transform) = &trigger.args_transform {
+        jseval::eval_js_expr(transform, &body)?
+    } else {
+        body
+    };
+
+    let job_id = state.trigger_handler.fire(
+        &workspace_id, &trigger.target_type, &trigger.target_path,
+        args, "webhook",
+    ).await?;
+
+    // 根據模式決定回傳方式
+    match params.mode.unwrap_or_default() {
+        RequestType::Async => Ok(Json(JobCreated { id: job_id }).into_response()),
+        RequestType::Sync => {
+            // 阻塞等待結果（復用 run_wait_result 機制）
+            run_wait_result_internal(
+                &state.db, &workspace_id, job_id, params.timeout, None,
+            ).await
+        }
+        RequestType::SyncSse => {
+            // SSE 串流日誌 + 最終結果（復用 stream_job_logs 機制）
+            Ok(stream_job_logs_response(&state.db, &workspace_id, job_id).await)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WebhookQueryParams {
+    pub mode: Option<RequestType>,   // async(預設), sync, sse
+    pub timeout: Option<u64>,        // sync 模式的超時秒數
+}
+```
+
+#### Cron 也套用 Trigger Trait
+
+Phase 3.1 已有的 Cron 排程，現在也納入 Trigger 框架：
+
+```rust
+pub struct CronTrigger;
+
+#[async_trait]
+impl Trigger for CronTrigger {
+    fn name(&self) -> &str { "cron" }
+
+    async fn start(&self, db: PgPool, handler: Arc<TriggerHandler>) -> Result<()> {
+        // 就是原本的 schedule_loop，改用 handler.fire() 推 job
+        tokio::spawn(async move { schedule_loop(db, handler).await });
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<()> { Ok(()) }
+}
+```
+
+**未來擴展**（Phase 4+）只需新增 trait 實作：
+
+```
+Phase 3:  CronTrigger + WebhookTrigger（已實作）
+Phase 4+: KafkaTrigger / MqttTrigger / NatsTrigger / PostgresCdcTrigger
+          → 各自實作 Trigger trait，不改核心程式碼
+```
+
+#### 新增 API
+
+```
+// Webhook 管理
+POST   /api/w/{ws}/webhook_triggers/create          // 建立 webhook trigger
+GET    /api/w/{ws}/webhook_triggers/list             // 列出
+DELETE /api/w/{ws}/webhook_triggers/{path}           // 刪除
+PUT    /api/w/{ws}/webhook_triggers/{path}/toggle    // 啟用/停用
+
+// Webhook 觸發（外部呼叫）
+POST   /api/w/{ws}/webhooks/{path}                   // 觸發 job
+```
+
+### 3.9 驗證方式
 
 ```
 1. 建立 `*/1 * * * *` 排程 → 確認每分鐘觸發
@@ -2851,6 +3871,10 @@ if let Some(interval) = schedule.data_interval_seconds {
 7. 所有操作在 Jaeger 可追蹤
 8. 並發控制: 設 tag="api" max=2 → 同時推 5 個 job → 確認最多 2 個同時跑
 9. data_interval: 每小時排程 → 確認 args 自動帶入正確的時間窗口
+10. Resource: 建立 postgres resource → script 參數用 $res:path → 執行後拿到解密的 dict
+11. Variable: 建立 secret variable → resource 內引用 $var:path → 確認嵌套替換正確
+12. 加密驗證: 直接查 DB → 確認 value_encrypted 是亂碼（非明文）
+13. Webhook sync + resource: webhook 觸發的 job 也能正確解析 $res: 引用
 ```
 
 ---
@@ -3091,20 +4115,65 @@ try {
 }
 ```
 
-### 4.4 Dedicated Worker（消除冷啟動）
+### 4.4 Dedicated Worker + Runner Groups（消除冷啟動）
 
-每個 job 都 spawn 新子程序，冷啟動佔比高。Dedicated Worker 保持語言 runtime 常駐：
+每個 job 都 spawn 新子程序，冷啟動佔比高。兩種模式從一開始就設計好。
+與**同步執行模式**搭配使用時效果最大——`run_wait_result` + Dedicated Worker = **~5ms 開銷**，
+把 FlowForge 變成一個延遲媲美直接呼叫函式的 API 服務：
 
 ```
-正常模式：  spawn python3 → import → main() → exit    ~65ms (冷啟動 60ms + 執行 5ms)
-Dedicated： python3 常駐 → loop { 收 job → main() }   ~5ms (13x 加速)
+Normal 模式：  spawn python3 → import → main() → exit    ~65ms（冷啟動 60ms + 執行 5ms）
+Dedicated：    python3 常駐 → loop { 收 job → main() }   ~5ms（13x 加速）
+Runner Group： python3 常駐 + 多 script 共用同一 runtime  ~5ms + 記憶體省 N 倍
 ```
+
+**兩種 Dedicated 模式的差異：**
+
+| | Dedicated（1:1） | Runner Group（N:1） |
+|---|---|---|
+| 對應關係 | 1 個 script = 1 個常駐程序 | N 個 script 共用 1 個常駐程序 |
+| 記憶體 | 每個 script 獨立載入依賴 | 同 group 的 script 共享依賴 |
+| 隔離性 | 完全隔離（不同程序） | 弱（同程序，全域狀態共享） |
+| 適用場景 | 單一高頻 script | 同團隊、同依賴的多個 script |
+
+**Runner Group 不適合與 K8s Pod Sandbox 組合**——Dedicated 的意義是「不重啟 runtime」，每 job 開新 Pod 就失去意義。
+
+**組合矩陣：**
+
+| 執行模型 | None | Rust Native | nsjail | WASM | K8s Pod |
+|---------|------|-------------|--------|------|---------|
+| Normal | 開發 | VM 生產 | VM 生產 | 輕量 JS | 重型/GPU |
+| Dedicated 1:1 | 開發 | VM 高頻 | VM 高頻 | 不適用 | 不適用 |
+| Runner Group | 開發 | VM 高頻 | VM 高頻 | 不適用 | 不適用 |
+
+#### Schema
+
+```sql
+-- Runner Group 定義
+CREATE TABLE runner_group (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    id VARCHAR(100) NOT NULL,            -- "data-team-pandas"
+    name VARCHAR(255) NOT NULL,
+    language VARCHAR(20) NOT NULL,       -- python3, typescript
+    dependencies TEXT[],                 -- ["pandas", "numpy", "requests"]
+    max_concurrent INTEGER DEFAULT 8,   -- 同時服務幾個 job
+    idle_timeout_secs INTEGER DEFAULT 300,  -- 閒置多久回收
+    created_by VARCHAR(255) NOT NULL,
+    PRIMARY KEY (workspace_id, id)
+);
+
+-- Script 可以指定歸屬哪個 Runner Group
+ALTER TABLE script ADD COLUMN runner_group_id VARCHAR(100);
+```
+
+#### Rust 實作
 
 ```rust
 // crates/worker/src/dedicated.rs
 
 use tokio::sync::mpsc;
 
+/// 單一 script 的 Dedicated Runner（1:1 模式）
 pub struct DedicatedRunner {
     tx: mpsc::Sender<DedicatedJob>,
     handle: tokio::task::JoinHandle<()>,
@@ -3112,7 +4181,23 @@ pub struct DedicatedRunner {
     script_path: String,
 }
 
+/// Runner Group（N:1 模式）— 多個 script 共用一個 runtime
+pub struct RunnerGroup {
+    tx: mpsc::Sender<GroupJob>,
+    handle: tokio::task::JoinHandle<()>,
+    language: ScriptLang,
+    group_id: String,
+    loaded_scripts: std::sync::Arc<tokio::sync::RwLock<HashSet<String>>>,
+}
+
 struct DedicatedJob {
+    args: serde_json::Value,
+    result_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+}
+
+struct GroupJob {
+    script_path: String,    // 要執行哪個 script
+    script_content: String, // 第一次載入時需要
     args: serde_json::Value,
     result_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
 }
@@ -3159,7 +4244,6 @@ while (true) {{
             _ => return Err(Error::UnsupportedLanguage(language)),
         };
 
-        // spawn 常駐子程序 + 收發 job 的 background task
         let handle = tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 // 寫 args 到 stdin → 讀 result 從 stdout → 回傳 oneshot
@@ -3173,6 +4257,88 @@ while (true) {{
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.tx.send(DedicatedJob { args, result_tx }).await?;
         result_rx.await?
+    }
+}
+
+impl RunnerGroup {
+    pub async fn spawn(
+        language: ScriptLang, group_id: &str, dependencies: &[String],
+        job_dir: &str, sandbox: &dyn Sandbox,
+    ) -> Result<Self> {
+        let (tx, mut rx) = mpsc::channel::<GroupJob>(64);
+        let loaded = std::sync::Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+
+        // Runner Group 的 Python 常駐程序：用 importlib 動態載入不同 script
+        let runner_code = match language {
+            ScriptLang::Python3 => r#"
+import json, sys, importlib, importlib.util, os
+
+loaded_modules = {}
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    script_name = request["script"]
+    args = request["args"]
+
+    # 動態載入 script（第一次寫入檔案 + import，之後用快取）
+    if script_name not in loaded_modules:
+        if "content" in request:
+            path = f"/tmp/group/{script_name}"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(request["content"])
+        spec = importlib.util.spec_from_file_location(script_name, f"/tmp/group/{script_name}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        loaded_modules[script_name] = mod
+
+    try:
+        result = loaded_modules[script_name].main(**args)
+        print(json.dumps({"ok": result}), flush=True)
+    except Exception as e:
+        print(json.dumps({"err": str(e)}), flush=True)
+"#.to_string(),
+            _ => return Err(Error::UnsupportedLanguage(language)),
+        };
+
+        let handle = tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                // 寫 {script, content?, args} 到 stdin → 讀 result → 回傳
+            }
+        });
+
+        Ok(Self { tx, handle, language, group_id: group_id.to_string(), loaded_scripts: loaded })
+    }
+
+    pub async fn execute(
+        &self, script_path: &str, script_content: &str, args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.tx.send(GroupJob {
+            script_path: script_path.to_string(),
+            script_content: script_content.to_string(),
+            args, result_tx,
+        }).await?;
+        result_rx.await?
+    }
+}
+
+/// Worker 主迴圈中選擇執行方式
+async fn dispatch_job(job: &QueuedJob, runners: &RunnerManager, sandbox: &dyn Sandbox) {
+    if let Some(group_id) = &job.runner_group_id {
+        // Runner Group 模式
+        let group = runners.get_or_create_group(group_id).await;
+        let result = group.execute(&job.script_path, &job.content, job.args.clone()).await;
+    } else if runners.has_dedicated(&job.script_path) {
+        // Dedicated 1:1 模式
+        let runner = runners.get_dedicated(&job.script_path);
+        let result = runner.execute(job.args.clone()).await;
+    } else {
+        // Normal 模式：spawn 新子程序
+        handle_job(job, sandbox).await;
     }
 }
 ```
@@ -3388,12 +4554,10 @@ flow_job (root span)
 
 - Iggy 取代 PostgreSQL queue（100K+ msg/sec）
 - Event-driven CEP（時間窗口、事件關聯）
-- Plugin-based trigger 框架（Webhook、Cron、Kafka、MQTT）
+- 更多 Trigger 類型：Kafka、MQTT、PostgreSQL CDC、S3 事件（基於 Phase 3 的 Trigger Trait 擴展）
 - App Builder（低代碼 UI）
-- Dedicated Worker 進階：Runner Groups（多個 script 共用依賴時共享同一 runtime）
 - Firecracker microVM 作為第五種沙箱模式（~125ms 啟動，AWS Lambda 底層技術）
 - Marketplace（分享自訂節點和 Flow 範本）
-- Flow 版本 diff UI 強化（visual diff，像 GitHub PR 的 side-by-side 比較）
 - Software-Defined Assets（學 Dagster，將 data lineage 做為 first-class 概念）
 
 ---
