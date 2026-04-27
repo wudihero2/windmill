@@ -2,7 +2,7 @@
 
 ## 目標
 
-從零打造一個工作流 / 資料管線平台（暫名 **FlowForge**），支援：
+從零打造一個工作流 / 資料管線平台（暫名 **CoveFlow**），支援：
 
 - 即時寫 Python（未來多語言）並執行
 - DAG 工作流（like Windmill Flow）
@@ -20,7 +20,7 @@
 
 先看全貌，後面各 Phase 會逐一實作：
 
-| 面向 | Windmill | FlowForge |
+| 面向 | Windmill | CoveFlow |
 |------|---------|-----------|
 | Flow Editor | 自建 SVG（5000+ 行） | `@xyflow/svelte`（現成）+ 內嵌 Monaco tab |
 | JS 求值 | QuickJS + Deno（C 依賴） | `boa_engine`（純 Rust） |
@@ -43,6 +43,10 @@
 | 並發控制 | 無 tag 級限制 | **ConcurrencyLimit**：tag 級並發上限（學 Prefect） |
 | 同步執行 | `run_wait_result`（DB 輪詢） | **同步模式**：NOTIFY 事件驅動 + Early Return + 斷線自動取消 |
 | Resource | `$res:path` 引用 + JSON Schema UI | **Resource 系統**：AES 加密 + `$res:` 引用替換 + 零 SDK 存取 |
+| 部署審核 | 無（直接覆蓋） | **Deploy Approval Gate**：路徑級審核政策 + 多人審批 + diff 預覽 |
+| 集群資源可視化 | vCPU + 記憶體（無磁碟、無 CPU 使用率） | **完整 Dashboard**：CPU 使用率 + 記憶體 + 磁碟 + 佔用率 |
+| 檔案上傳 | S3 上傳 + SDK 存取（EE 功能） | **File Storage**：S3 / 本地雙模式 + 拖拉上傳 + 檔案瀏覽器 |
+| 多團隊 RBAC | Group + Folder + extra_perms | **Group + Folder + ACL + Quota**：團隊資源配額 + 路徑級讀寫控制 |
 
 ---
 
@@ -65,7 +69,7 @@
 ## 專案結構
 
 ```
-flowforge/
+coveflow/
 ├── backend/
 │   ├── Cargo.toml                 # workspace
 │   ├── src/main.rs                # Server + Worker 入口
@@ -81,6 +85,12 @@ flowforge/
 │       │       ├── flow_files.rs      # Flow 工作區檔案 CRUD
 │       │       ├── jobs.rs            # Job 執行/查詢
 │       │       ├── resources.rs      # Resource CRUD + 加解密
+│       │       ├── deploy.rs        # Deploy Approval Gate（審核政策 + 部署請求）
+│       │       ├── files.rs         # File Storage（上傳/下載/列表/預覽）
+│       │       ├── cluster.rs       # Cluster Dashboard（worker 資源監控）
+│       │       ├── groups.rs        # Group CRUD + 成員管理
+│       │       ├── folders.rs       # Folder CRUD + ACL 管理
+│       │       ├── acl.rs           # 權限檢查（require_reader/writer/owner）
 │       │       └── sse.rs             # SSE 日誌串流
 │       ├── types/                 # 領域型別
 │       │   ├── Cargo.toml         # deps: serde, uuid, chrono
@@ -122,7 +132,11 @@ flowforge/
 │   │   │   ├── flows/             # Flow 頁面
 │   │   │   ├── jobs/              # Job 頁面
 │   │   │   ├── resources/         # Resource 管理頁面
-│   │   │   └── schedules/         # 排程頁面
+│   │   │   ├── schedules/         # 排程頁面
+│   │   │   ├── files/             # 檔案瀏覽器頁面
+│   │   │   ├── workers/           # 集群資源 Dashboard
+│   │   │   ├── groups/            # 團隊管理 + 配額
+│   │   │   └── settings/          # 設定頁面（Approval Policies, Folders ACL）
 │   │   └── lib/
 │   │       ├── components/
 │   │       │   ├── ScriptEditor.svelte   # Monaco
@@ -132,7 +146,14 @@ flowforge/
 │   │       │   ├── DataPreviewTable.svelte # 資料查詢預覽表格
 │   │       │   ├── LogViewer.svelte      # SSE 即時日誌
 │   │       │   ├── ArgInput.svelte       # JSON Schema → 表單
-│   │       │   └── ResourceEditor.svelte # Resource 管理 UI
+│   │       │   ├── ResourceEditor.svelte # Resource 管理 UI
+│   │       │   ├── DeployGate.svelte    # 部署審核面板（diff + approve/reject）
+│   │       │   ├── FileUpload.svelte    # 拖拉上傳 + 進度條
+│   │       │   ├── FileBrowser.svelte   # S3/本地檔案瀏覽器
+│   │       │   ├── ClusterDashboard.svelte # Worker 資源監控儀表板
+│   │       │   ├── GroupManager.svelte  # 團隊 CRUD + 成員管理
+│   │       │   ├── FolderAcl.svelte    # Folder ACL 編輯器（權限矩陣）
+│   │       │   └── QuotaPanel.svelte   # 團隊配額設定 + 用量儀表板
 │   │       ├── gen/                      # OpenAPI 生成
 │   │       └── stores/
 │   └── package.json
@@ -189,7 +210,7 @@ flowforge/
 ```
 
 **為什麼 Windmill 沒用 NOTIFY？** Windmill worker 以 50ms 間隔輪詢，高吞吐時幾乎永遠有 job 可拉，NOTIFY 收益不大。
-但 FlowForge 定位支援低延遲同步 API（`run_wait_result`），NOTIFY 把 queue→start 從 ~50ms 降到 ~1-5ms，非常值得。
+但 CoveFlow 定位支援低延遲同步 API（`run_wait_result`），NOTIFY 把 queue→start 從 ~50ms 降到 ~1-5ms，非常值得。
 
 ### Job 三表分離設計
 
@@ -251,6 +272,7 @@ Windmill 的 nsjail 是**後加的**，導致每個 executor 都有 `if is_sandb
 | **Bash 執行** | **支援** | **支援** | 不支援 | **支援** |
 | **GPU** | 不支援 | 不支援 | 不支援 | **K8s 原生** |
 | **外部依賴** | 無（純 Rust crate） | nsjail binary (C++) | 無（純 Rust crate） | K8s cluster |
+| **磁碟限制** | tmpfs（需 root） | tmpfs_size ✅ | 虛擬 FS ✅ | ephemeral-storage ✅ |
 | **安全等級** | 高（多層防禦） | 高 | **最高**（記憶體安全） | 最高 |
 
 **按 Job 類型選擇：**
@@ -401,7 +423,7 @@ CREATE TABLE flow_file (
 
 **我們的選擇：Windmill 模式 + AES 加密**
 
-理由：**使用者的程式碼完全不需要 import 任何 FlowForge SDK**。Worker 在執行前把 `$res:path` 替換成實際值，寫入 `args.json`，使用者的函數收到的就是普通 dict。
+理由：**使用者的程式碼完全不需要 import 任何 CoveFlow SDK**。Worker 在執行前把 `$res:path` 替換成實際值，寫入 `args.json`，使用者的函數收到的就是普通 dict。
 
 ```
 資料流：
@@ -415,7 +437,7 @@ CREATE TABLE flow_file (
 ```
 
 ```python
-# 使用者寫的 script —— 完全不知道 FlowForge 的存在
+# 使用者寫的 script —— 完全不知道 CoveFlow 的存在
 def main(db: dict, api_key: str):
     # db = {"host": "prod-pg.example.com", "port": 5432, "password": "s3cret"}
     import psycopg2
@@ -427,11 +449,11 @@ def main(db: dict, api_key: str):
 
 ### 同步執行模式（學習 Windmill `run_wait_result`）
 
-**使用場景**：把 FlowForge 當作 API 使用——外部系統呼叫 workflow，阻塞等待結果後回傳。
+**使用場景**：把 CoveFlow 當作 API 使用——外部系統呼叫 workflow，阻塞等待結果後回傳。
 
 ```
 典型情境：貸款系統 → POST /api/w/prod/jobs/run_wait_result/f/credit-scoring
-         → FlowForge 執行信用評分 flow
+         → CoveFlow 執行信用評分 flow
          → HTTP 阻塞等待
          → 200 OK { "score": 720, "approved": true }
          → 總延遲 < 200ms（Dedicated Worker + 輕量 Python）
@@ -471,6 +493,218 @@ Runner Group:       ~5ms  + ~0ms  + exec     ≈ 5ms + exec
   Dedicated:   5 + 50 = ~55ms  ✓ 遠低於 1 秒
 ```
 
+### Deploy Approval Gate（部署審核門禁）
+
+**問題**：生產環境的 Flow/Script 不能隨便改。需要審核機制防止未經授權的變更上線。
+
+**各平台比較**：
+
+| 平台 | 部署審核機制 |
+|------|-------------|
+| Windmill | 無內建。依賴 Git Sync + 外部 PR review |
+| Airflow | 無內建。DAG 部署靠 CI/CD |
+| Prefect | 無內建。Deployment 靠 CLI + CI |
+| Kestra | EE 有 Namespace-level 權限，但無逐次審核 |
+| Temporal | 無內建。靠 CI/CD |
+| **CoveFlow** | **內建 Deploy Approval Gate：路徑級審核政策 + 多人審批 + diff 預覽** |
+
+**設計原則**：
+
+1. **零阻力預設**：沒有設 policy 的路徑 → 跟以前一樣直接 deploy
+2. **路徑級粒度**：`f/production/*` 要 2 人審核，`f/sandbox/*` 不需要
+3. **類似 PR Review**：看 diff → approve/reject + 留言
+4. **自動生效**：達到 `min_approvals` 後，一鍵部署或自動部署
+
+```
+使用者修改 Flow
+      │
+      ▼
+  儲存 Draft（不影響線上版本）
+      │
+      ▼
+  ┌─ 檢查 approval_policy ─┐
+  │                         │
+  │ 無 policy               │ 有 policy（match path_pattern）
+  │ → 直接 deploy           │ → 建立 deploy_request
+  │                         │     │
+  └─────────────────────────┘     ▼
+                              通知 approvers（in-app / webhook）
+                                  │
+                              ┌───┴───┐
+                              │ 審核  │
+                              │diff+留言│
+                              └───┬───┘
+                            ┌────┴────┐
+                         Approve    Reject
+                            │         │
+                            ▼         ▼
+                  達到 min_approvals  回到 Draft
+                            │       （附 reject 原因）
+                            ▼
+                       正式 Deploy
+                     （新版本上線）
+```
+
+### File Storage（檔案儲存系統）
+
+**問題**：使用者需要上傳 CSV、JSON、ML 模型等檔案給 Script/Flow 使用。
+
+**各平台比較**：
+
+| 平台 | 檔案上傳 | 儲存後端 | Script 存取方式 | 預覽 |
+|------|---------|---------|----------------|------|
+| Windmill | ✅ REST 串流（EE） | S3/Azure/GCS/本地 | SDK: `loadS3File()` | ✅ CSV/Parquet |
+| Kestra | ✅ multipart | S3/GCS/Azure/本地 | `kestra:///` URI | ❌ |
+| Airflow | ❌ 無內建 | 靠 XCom + providers | 手動用 boto3 | ❌ |
+| Prefect | ❌ 無內建 | 靠 Storage Blocks | 手動用 boto3 | ❌ |
+| **CoveFlow** | **✅ 拖拉上傳 + 進度** | **S3 / 本地雙模式** | **自動下載到 job_dir** | **✅ CSV/JSON/text** |
+
+**CoveFlow 與 Windmill 的關鍵差異**：
+
+| 面向 | Windmill | CoveFlow |
+|------|---------|---------|
+| Script 讀取方式 | 需要用 SDK `loadS3File()` | **Worker 自動下載到 job_dir**，`open("input/data.csv")` 即可 |
+| 儲存後端 | S3/Azure/GCS/本地（多種） | **S3 + 本地**（兩種，簡化配置） |
+| OSS 支援 | 串流上傳是 EE 功能 | **完全開源** |
+
+**資料流**：
+
+```
+使用者拖拉上傳
+    │
+    ▼
+POST /api/w/{ws}/files/upload
+    │
+    ├── storage_mode = "s3"  → 上傳到 S3/MinIO
+    │                          回傳 FileRef { s3: "uploads/2025/data.csv" }
+    │
+    └── storage_mode = "local" → 寫入 {data_dir}/files/{workspace}/{path}
+                                 回傳 FileRef { local: "data.csv" }
+
+Script 參數中引用：
+    args = { "input_file": { "s3": "uploads/2025/data.csv" } }
+    │
+    ▼
+Worker 執行前自動處理：
+    resolve_file_refs(args, job_dir)
+    │
+    ├── S3 模式 → 下載到 {job_dir}/input/data.csv
+    └── 本地模式 → symlink 或 copy 到 {job_dir}/input/data.csv
+
+使用者程式碼：
+    import pandas as pd
+    df = pd.read_csv("input/data.csv")  # 就這麼簡單
+```
+
+### 多團隊 RBAC（Group + Folder + ACL + Quota）
+
+**問題**：大公司有多個團隊（ML、Data Engineering、Finance），需要：
+1. 團隊間**資源隔離**（Script / Flow / Resource 互不可見或唯讀）
+2. 團隊級**資源配額**（防止某團隊吃光所有 Worker / Storage）
+3. **路徑級存取控制**（誰能讀、誰能寫、誰是 owner）
+4. **審計可追溯**（哪個團隊消耗多少資源）
+
+**各平台比較**：
+
+| 平台 | 團隊/群組 | 路徑 ACL | 團隊配額 |
+|------|----------|---------|---------|
+| Windmill | ✅ Group + Folder + extra_perms | ✅ 路徑級讀/寫/owner | ❌ 無 |
+| Airflow | ❌ 靠外部 LDAP | ❌ DAG-level role | ❌ 無 |
+| Prefect | ❌ workspace 級 | ❌ 無路徑 ACL | ❌ 無 |
+| Kestra | ✅ Namespace 級（EE） | ❌ 粗粒度 | ❌ 無 |
+| **CoveFlow** | **✅ Group + Folder** | **✅ extra_perms（讀/寫/owner）** | **✅ 團隊級配額** |
+
+**核心設計（學 Windmill，加入團隊配額）**：
+
+```
+Workspace（公司/組織）
+    │
+    ├── Group（團隊）
+    │   ├── ml-team      members: [alice, bob]
+    │   ├── data-eng     members: [charlie, dave]
+    │   └── all          members: [*]  （內建，所有人）
+    │
+    ├── Folder（路徑級 ACL 容器）
+    │   ├── f/ml-team/          owners: [g/ml-team]
+    │   │   ├── f/ml-team/training_flow
+    │   │   └── f/ml-team/predict_script
+    │   ├── f/data-eng/         owners: [g/data-eng]
+    │   ├── f/shared/           owners: [g/all]     ← 所有人可存取
+    │   └── f/production/       owners: [u/admin]   ← 需 Deploy Approval
+    │
+    └── Group Quota（資源配額）
+        ├── ml-team:    max_concurrent=10, max_storage=50GB
+        └── data-eng:   max_concurrent=20, max_storage=100GB
+```
+
+**路徑規範**：
+
+```
+u/alice/my_script       → 個人路徑，只有 alice 可讀寫
+f/ml-team/training      → 團隊路徑，由 folder ACL 控制
+f/shared/utils          → 共用路徑，所有人可讀
+```
+
+**ACL 模型（`extra_perms` JSONB）**：
+
+```json
+{
+    "u/alice": true,       // alice 可讀寫
+    "g/ml-team": true,     // ml-team 成員可讀寫
+    "g/data-eng": false,   // data-eng 成員唯讀
+    "g/all": false         // 其他人唯讀
+}
+// true = 讀寫，false = 唯讀，key 不存在 = 無權限
+```
+
+**權限檢查優先序**：
+
+```
+1. is_admin? → 全部放行
+2. path 以 "u/{username}/" 開頭？ → 只有本人可讀寫
+3. path 以 "f/{folder}/" 開頭？ → 查 folder.extra_perms
+   → 先查 u/{username}，再查 g/{groups}
+   → 第一個 match 決定權限
+4. 都沒 match → 無權限（403）
+```
+
+**團隊配額防禦層（擴充現有並發控制）**：
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Layer 1-4（現有）：Worker 數量 / 全域上限 / Tag 級 / 反壓  │
+├────────────────────────────────────────────────────────┤
+│ Layer 5：團隊配額（group_quota 表）NEW                    │
+│   ml-team: max_concurrent_jobs = 10                    │
+│   → push_job() 檢查該團隊正在跑的 job 數                  │
+│   → 超過 → 排隊等待（不 reject，只延後）                   │
+│                                                        │
+│   ml-team: max_storage_bytes = 50GB                    │
+│   → upload_file() 檢查該團隊目前儲存用量                   │
+│   → 超過 → 403 "quota exceeded"                        │
+├────────────────────────────────────────────────────────┤
+│ 如何判斷 job 屬於哪個團隊？                                │
+│   → 看 job.script_path / flow_path 的路徑前綴              │
+│   → "f/ml-team/training" → folder "ml-team" → owners    │
+│   → 取第一個 g/ owner 作為 team                           │
+│   → 或直接在 job 表記錄 folder_owner                      │
+└────────────────────────────────────────────────────────┘
+```
+
+**影響範圍**：
+
+| 現有段落 | 需要修改 |
+|---------|---------|
+| Phase 1 Schema | 新增 `group_`、`usr_to_group`、`folder`、`group_quota` 表 |
+| Phase 1 Auth | `AuthedUser` 增加 groups + folders 欄位 |
+| Phase 1 Router | 新增 Group / Folder / Quota API 路由 |
+| Phase 1 Script CRUD | 加 `require_writer(path)` 檢查 |
+| Phase 1 Job push | 加團隊歸屬 + 配額檢查 |
+| Phase 3 Resource | Resource/Variable 納入 Folder ACL |
+| Phase 3 File Storage | 加團隊儲存配額 |
+| Phase 3 Cluster Dashboard | 加團隊資源用量視角 |
+| Phase 3 Deploy Approval | 修復 `usr_to_group` 引用（現在有定義了）|
+
 ---
 
 ## Phase 1：基礎建設（Week 1-3）
@@ -501,8 +735,59 @@ CREATE TABLE account (
 CREATE TABLE workspace_member (
     workspace_id VARCHAR(50) REFERENCES workspace(id),
     email VARCHAR(255) REFERENCES account(email),
-    role VARCHAR(20) NOT NULL DEFAULT 'editor',  -- admin, editor, viewer
+    role VARCHAR(20) NOT NULL DEFAULT 'editor',  -- admin, editor, viewer, operator
     PRIMARY KEY (workspace_id, email)
+);
+
+-- === 團隊 + 路徑 ACL ===
+
+-- 團隊（同 Windmill group_）
+CREATE TABLE group_ (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    name VARCHAR(100) NOT NULL,              -- "ml-team", "sre", "data-eng"
+    summary TEXT DEFAULT '',
+    -- 額外權限（可讀/寫指定路徑，含 folder 路徑）
+    extra_perms JSONB NOT NULL DEFAULT '{}', -- {"u/alice": true, "g/sre": false}
+    PRIMARY KEY (workspace_id, name)
+);
+
+-- 使用者 ↔ 團隊 對應
+CREATE TABLE usr_to_group (
+    workspace_id VARCHAR(50) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    group_ VARCHAR(100) NOT NULL,
+    PRIMARY KEY (workspace_id, email, group_),
+    FOREIGN KEY (workspace_id, group_) REFERENCES group_(workspace_id, name) ON DELETE CASCADE
+);
+
+-- 資料夾（路徑級 ACL 的核心）
+-- 所有 f/ 開頭的路徑都由 folder 管理權限
+CREATE TABLE folder (
+    workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    name VARCHAR(100) NOT NULL,              -- "ml-team", "production", "shared"
+    display_name VARCHAR(255) DEFAULT '',
+    owners TEXT[] NOT NULL DEFAULT '{}',      -- 完全控制權：['u/alice', 'g/sre']
+    -- 額外權限：讀/寫控制
+    -- key = permission subject (u/alice, g/ml-team)
+    -- value = true (read+write), false (read-only)
+    extra_perms JSONB NOT NULL DEFAULT '{}', -- {"u/bob": false, "g/data-eng": true}
+    PRIMARY KEY (workspace_id, name)
+);
+
+-- 團隊資源配額（Windmill 沒有，CoveFlow 獨有）
+CREATE TABLE group_quota (
+    workspace_id VARCHAR(50) NOT NULL,
+    group_ VARCHAR(100) NOT NULL,
+    -- 並發 job 數上限（NULL = 不限）
+    max_concurrent_jobs INTEGER,
+    -- 每日 job 數上限（NULL = 不限）
+    max_daily_jobs INTEGER,
+    -- 檔案儲存配額 bytes（NULL = 不限）
+    max_storage_bytes BIGINT,
+    -- 單一 job 最大執行時間秒（NULL = 用全域預設）
+    max_job_timeout_secs INTEGER,
+    PRIMARY KEY (workspace_id, group_),
+    FOREIGN KEY (workspace_id, group_) REFERENCES group_(workspace_id, name) ON DELETE CASCADE
 );
 
 -- === Script ===
@@ -542,6 +827,8 @@ CREATE TABLE job (
     root_job UUID,                     -- flow 的 root job
     flow_step_id VARCHAR(50),          -- 在 flow 中的步驟 ID
     flow_revision INTEGER,              -- 執行時的 flow 版本（可追溯）
+    -- 團隊歸屬（從 script/flow path 自動推導）
+    folder_owner VARCHAR(100),           -- NULL（個人 u/...）或 folder 名（f/ml-team/...）
     created_by VARCHAR(255) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- OTel trace context
@@ -687,6 +974,44 @@ CREATE TABLE variable (
     PRIMARY KEY (workspace_id, path)
 );
 
+-- === Deploy Approval Gate（部署審核）===
+
+-- 審核政策：哪些路徑的 Flow/Script 需要審核才能上線
+CREATE TABLE approval_policy (
+    workspace_id    VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    path_pattern    VARCHAR(255) NOT NULL,  -- glob: 'f/production/*', 'f/finance/*'
+    min_approvals   INTEGER NOT NULL DEFAULT 1,
+    approvers       TEXT[] NOT NULL,         -- ['u/alice', 'g/sre-team']
+    auto_deploy     BOOLEAN DEFAULT FALSE,  -- 達到 min_approvals 後自動部署？
+    PRIMARY KEY (workspace_id, path_pattern)
+);
+
+-- 部署請求（類似 Pull Request）
+CREATE TABLE deploy_request (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    VARCHAR(50) NOT NULL REFERENCES workspace(id),
+    target_path     VARCHAR(255) NOT NULL,       -- 要部署的 flow/script 路徑
+    target_kind     VARCHAR(10) NOT NULL,        -- 'flow' | 'script'
+    draft_value     JSONB NOT NULL,              -- 新版本內容
+    previous_hash   VARCHAR(64),                 -- 舊版本 hash（用於 diff）
+    requested_by    VARCHAR(255) NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending/approved/rejected/deployed
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deployed_at     TIMESTAMPTZ
+);
+
+CREATE INDEX idx_deploy_request_ws_status ON deploy_request(workspace_id, status);
+
+-- 個別審核紀錄
+CREATE TABLE deploy_approval (
+    deploy_request_id  UUID NOT NULL REFERENCES deploy_request(id),
+    approver           VARCHAR(255) NOT NULL,
+    decision           VARCHAR(10) NOT NULL,     -- 'approved' | 'rejected'
+    comment            TEXT DEFAULT '',
+    decided_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (deploy_request_id, approver)
+);
+
 -- === Worker 管理 ===
 
 -- 全域 Worker 並發控制
@@ -700,7 +1025,7 @@ CREATE TABLE worker_config (
     PRIMARY KEY (workspace_id)
 );
 
--- Worker 健康 + 狀態
+-- Worker 健康 + 狀態 + 資源監控
 CREATE TABLE worker_ping (
     worker VARCHAR(100) PRIMARY KEY,
     ping_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -708,7 +1033,37 @@ CREATE TABLE worker_ping (
     ip VARCHAR(45),
     sandbox_mode VARCHAR(20),       -- "nsjail", "k8s", "none"
     current_job_id UUID,            -- 正在跑的 job（NULL = 閒置）
-    jobs_completed INTEGER DEFAULT 0  -- 累計完成數（監控用）
+    jobs_completed INTEGER DEFAULT 0, -- 累計完成數（監控用）
+    -- 資源配額（靜態，啟動時偵測）
+    vcpus INTEGER,                  -- vCPU 數（cgroup quota / sysinfo）
+    memory_total BIGINT,            -- 總記憶體 bytes（cgroup limit / meminfo）
+    disk_total BIGINT,              -- job_dir 所在磁碟總容量 bytes
+    -- 資源用量（每次 ping 更新）
+    cpu_usage_percent REAL,         -- CPU 使用率 %（/proc/stat delta）
+    memory_usage BIGINT,            -- 目前記憶體用量 bytes（cgroup current）
+    disk_usage BIGINT,              -- 目前磁碟用量 bytes（statvfs）
+    -- 佔用率（多時間窗口）
+    occupancy_15s REAL,             -- 15 秒佔用率
+    occupancy_5m REAL,              -- 5 分鐘佔用率
+    occupancy_30m REAL              -- 30 分鐘佔用率
+);
+
+-- === File Storage 設定 ===
+
+CREATE TABLE workspace_settings (
+    workspace_id VARCHAR(50) PRIMARY KEY REFERENCES workspace(id),
+    -- 檔案儲存模式：'s3' | 'local'
+    file_storage_mode VARCHAR(10) NOT NULL DEFAULT 'local',
+    -- S3 模式設定
+    s3_bucket VARCHAR(255),
+    s3_region VARCHAR(50),
+    s3_endpoint VARCHAR(255),         -- 自建 MinIO: "http://minio:9000"
+    s3_access_key_encrypted BYTEA,    -- AES-256-GCM 加密
+    s3_secret_key_encrypted BYTEA,    -- AES-256-GCM 加密
+    -- 本地模式設定
+    local_data_dir VARCHAR(500) DEFAULT '/data/coveflow/files',
+    -- 限制
+    max_file_size BIGINT DEFAULT 104857600  -- 100MB 預設
 );
 ```
 
@@ -890,17 +1245,64 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
     let mut tx = db.begin().await?;
     let job_id = Uuid::new_v4();
 
+    // 0. Layer 5：團隊配額檢查（如果 job 屬於某 folder/group）
+    if let Some(folder_owner) = args.folder_owner {
+        // 查對應團隊的 group_quota
+        let quota = sqlx::query!(
+            "SELECT max_concurrent_jobs, max_daily_jobs FROM group_quota
+             WHERE workspace_id = $1 AND group_ = $2",
+            args.workspace_id, folder_owner
+        ).fetch_optional(&mut *tx).await?;
+
+        if let Some(q) = quota {
+            // 檢查並發上限
+            if let Some(max_conc) = q.max_concurrent_jobs {
+                let running: i64 = sqlx::query_scalar!(
+                    "SELECT COUNT(*) FROM job_queue jq
+                     JOIN job j ON j.id = jq.id
+                     WHERE j.workspace_id = $1
+                       AND j.folder_owner = $2
+                       AND jq.running = TRUE",
+                    args.workspace_id, folder_owner
+                ).fetch_one(&mut *tx).await?.unwrap_or(0);
+                if running >= max_conc as i64 {
+                    return Err(anyhow::anyhow!(
+                        "group '{}' concurrent job limit reached ({}/{})",
+                        folder_owner, running, max_conc
+                    ));
+                }
+            }
+            // 檢查每日上限
+            if let Some(max_daily) = q.max_daily_jobs {
+                let today_count: i64 = sqlx::query_scalar!(
+                    "SELECT COUNT(*) FROM job j
+                     WHERE j.workspace_id = $1
+                       AND j.folder_owner = $2
+                       AND j.created_at >= CURRENT_DATE",
+                    args.workspace_id, folder_owner
+                ).fetch_one(&mut *tx).await?.unwrap_or(0);
+                if today_count >= max_daily as i64 {
+                    return Err(anyhow::anyhow!(
+                        "group '{}' daily job limit reached ({}/{})",
+                        folder_owner, today_count, max_daily
+                    ));
+                }
+            }
+        }
+    }
+
     // 1. 插入 job（不可變定義）
     sqlx::query!(
         "INSERT INTO job (id, workspace_id, kind, script_hash, script_path,
          raw_code, language, args, tag, parent_job, root_job, flow_step_id,
-         created_by, trace_id, span_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+         folder_owner, created_by, trace_id, span_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
         job_id, args.workspace_id, args.kind.as_str(),
         args.script_hash, args.script_path,
         args.raw_code, args.language.map(|l| l.as_str()),
         args.args, args.tag,
         args.parent_job, args.root_job, args.flow_step_id,
+        args.folder_owner,
         args.created_by, args.trace_id, args.span_id,
     )
     .execute(&mut *tx)
@@ -950,21 +1352,39 @@ pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result
         }
     }
 
-    // 2. 同時檢查 tag 級並發上限（ConcurrencyLimit 表）
+    // 2. 同時檢查 tag 級 + 團隊級並發上限
+    //    Layer 3: tag 級（concurrency_limit 表）
+    //    Layer 5: 團隊級（group_quota 表，透過 job.folder_owner JOIN）
     let row = sqlx::query_as!(PulledJob,
         r#"
         WITH next_job AS (
             SELECT jq.id, jq.tag
             FROM job_queue jq
+            JOIN job j ON j.id = jq.id
             WHERE jq.running = FALSE
               AND jq.scheduled_for <= now()
               AND jq.tag = ANY($1)
-              -- tag 級並發控制：跳過已達上限的 tag
+              -- Layer 3: tag 級並發控制
               AND NOT EXISTS (
                   SELECT 1 FROM concurrency_limit cl
                   WHERE cl.tag = jq.tag
                     AND (SELECT COUNT(*) FROM job_queue jq2
                          WHERE jq2.tag = jq.tag AND jq2.running = TRUE) >= cl.max_concurrent
+              )
+              -- Layer 5: 團隊級並發控制（group_quota）
+              AND (
+                  j.folder_owner IS NULL  -- 個人 job 不受團隊配額限制
+                  OR NOT EXISTS (
+                      SELECT 1 FROM group_quota gq
+                      WHERE gq.workspace_id = j.workspace_id
+                        AND gq.group_ = j.folder_owner
+                        AND gq.max_concurrent_jobs IS NOT NULL
+                        AND (SELECT COUNT(*) FROM job_queue jq3
+                             JOIN job j3 ON j3.id = jq3.id
+                             WHERE j3.workspace_id = j.workspace_id
+                               AND j3.folder_owner = j.folder_owner
+                               AND jq3.running = TRUE) >= gq.max_concurrent_jobs
+                  )
               )
             ORDER BY jq.priority DESC, jq.scheduled_for ASC
             LIMIT 1
@@ -1044,7 +1464,7 @@ pub async fn run_worker(
     sandbox_router: Arc<SandboxRouter>,
     tracer: opentelemetry::global::BoxedTracer,
 ) {
-    let worker_dir = format!("/tmp/flowforge/{}", worker_name);
+    let worker_dir = format!("/tmp/coveflow/{}", worker_name);
     tokio::fs::create_dir_all(&worker_dir).await.unwrap();
 
     // 健康檢查：定期 ping
@@ -1253,13 +1673,53 @@ pub fn create_router(db: PgPool, sandbox: Arc<SandboxRouter>) -> Router {
             // Concurrency Limits（Phase 3）
             .route("/concurrency_limits", get(concurrency::list_limits))
             .route("/concurrency_limits/:tag", put(concurrency::set_limit).delete(concurrency::delete_limit))
+            // Deploy Approval Gate（Phase 3）
+            .route("/approval_policies", get(deploy::list_policies).post(deploy::create_policy))
+            .route("/approval_policies/p/*pattern", put(deploy::update_policy).delete(deploy::delete_policy))
+            .route("/deploy_requests/create", post(deploy::create_deploy_request))
+            .route("/deploy_requests/list", get(deploy::list_deploy_requests))
+            .route("/deploy_requests/:id", get(deploy::get_deploy_request))
+            .route("/deploy_requests/:id/diff", get(deploy::get_deploy_diff))
+            .route("/deploy_requests/:id/approve", post(deploy::approve_deploy))
+            .route("/deploy_requests/:id/reject", post(deploy::reject_deploy))
+            .route("/deploy_requests/:id/deploy", post(deploy::execute_deploy))
+            // File Storage（Phase 3）
+            .route("/files/upload", post(files::upload_file))
+            .route("/files/upload/*path", post(files::upload_file_to_path))
+            .route("/files/download/*path", get(files::download_file))
+            .route("/files/list", get(files::list_files))
+            .route("/files/metadata/*path", get(files::get_file_metadata))
+            .route("/files/preview/*path", get(files::preview_file))
+            .route("/files/delete/*path", delete(files::delete_file))
+            // Cluster Dashboard（Phase 3）
+            .route("/workers/list", get(cluster::list_workers))
+            .route("/workers/summary", get(cluster::cluster_summary))
+            .route("/workers/group_usage", get(cluster::group_resource_usage))
+            // Groups（團隊管理）
+            .route("/groups/list", get(groups::list_groups))
+            .route("/groups/create", post(groups::create_group))
+            .route("/groups/get/:name", get(groups::get_group))
+            .route("/groups/update/:name", put(groups::update_group))
+            .route("/groups/delete/:name", delete(groups::delete_group))
+            .route("/groups/:name/members", get(groups::list_members).post(groups::add_member))
+            .route("/groups/:name/members/:email", delete(groups::remove_member))
+            // Folders（路徑 ACL）
+            .route("/folders/list", get(folders::list_folders))
+            .route("/folders/create", post(folders::create_folder))
+            .route("/folders/get/:name", get(folders::get_folder))
+            .route("/folders/update/:name", put(folders::update_folder))
+            .route("/folders/delete/:name", delete(folders::delete_folder))
+            .route("/folders/:name/acl", put(folders::update_folder_acl))
+            // Group Quotas（團隊資源配額，admin only）
+            .route("/group_quotas/list", get(groups::list_quotas))
+            .route("/group_quotas/:group", get(groups::get_quota).put(groups::set_quota).delete(groups::delete_quota))
             .layer(auth_middleware)
         )
         .with_state(AppState { db, sandbox })
 }
 ```
 
-#### Auth（JWT + Argon2）
+#### Auth（JWT + Argon2 + RBAC）
 
 ```rust
 // crates/api/src/auth.rs
@@ -1269,6 +1729,141 @@ use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Claims { email: String, exp: u64 }
+
+/// 認證後的使用者上下文（每個 request 都會帶著）
+/// require_auth middleware 會從 DB 查詢 groups + folders
+#[derive(Clone, Debug)]
+pub struct AuthedUser {
+    pub email: String,
+    pub workspace_id: String,
+    pub is_admin: bool,
+    /// 使用者所屬的團隊列表 e.g. ["ml-team", "data-eng"]
+    pub groups: Vec<String>,
+    /// 使用者的權限主體列表（用於 extra_perms 比對）
+    /// e.g. ["u/alice", "g/ml-team", "g/data-eng"]
+    pub perm_subjects: Vec<String>,
+    /// 使用者可存取的 folder → 權限等級
+    /// true = read+write, false = read-only
+    pub folders: HashMap<String, bool>,
+}
+
+impl AuthedUser {
+    /// 是否有某路徑的寫入權限
+    pub fn can_write(&self, path: &str) -> bool {
+        if self.is_admin { return true; }
+        // 個人路徑：u/alice/... → 只有 alice 可寫
+        if let Some(owner) = path.strip_prefix("u/") {
+            let owner_email_part = owner.split('/').next().unwrap_or("");
+            return self.email.starts_with(owner_email_part);
+        }
+        // Folder 路徑：f/ml-team/... → 查 folder extra_perms
+        if let Some(folder_name) = path.strip_prefix("f/") {
+            let folder_name = folder_name.split('/').next().unwrap_or("");
+            return self.folders.get(folder_name).copied() == Some(true);
+        }
+        false
+    }
+
+    /// 是否有某路徑的讀取權限
+    pub fn can_read(&self, path: &str) -> bool {
+        if self.is_admin { return true; }
+        if let Some(owner) = path.strip_prefix("u/") {
+            let owner_email_part = owner.split('/').next().unwrap_or("");
+            return self.email.starts_with(owner_email_part);
+        }
+        if let Some(folder_name) = path.strip_prefix("f/") {
+            let folder_name = folder_name.split('/').next().unwrap_or("");
+            return self.folders.contains_key(folder_name); // true 或 false 都有讀取權
+        }
+        false
+    }
+
+    /// 要求寫入權限，否則回 403
+    pub fn require_writer(&self, path: &str) -> Result<(), ApiError> {
+        if self.can_write(path) { Ok(()) }
+        else { Err(ApiError::Forbidden(format!("no write access to '{}'", path))) }
+    }
+
+    /// 要求讀取權限，否則回 403
+    pub fn require_reader(&self, path: &str) -> Result<(), ApiError> {
+        if self.can_read(path) { Ok(()) }
+        else { Err(ApiError::Forbidden(format!("no read access to '{}'", path))) }
+    }
+}
+
+/// Auth middleware：JWT 解碼 → 查 DB 取 groups + folders → 注入 Extension
+pub async fn require_auth(
+    State(db): State<PgPool>,
+    Path(workspace_id): Path<String>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let token = req.headers().get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+
+    let claims = decode::<Claims>(token, &DecodingKey::from_secret(JWT_SECRET.as_bytes()), &Validation::default())
+        .map_err(|_| ApiError::Unauthorized)?
+        .claims;
+
+    // 1. 查 workspace_member 確認角色
+    let member = sqlx::query!(
+        "SELECT role FROM workspace_member WHERE workspace_id = $1 AND email = $2",
+        workspace_id, claims.email
+    ).fetch_optional(&db).await?
+     .ok_or(ApiError::Forbidden("not a member of this workspace".into()))?;
+
+    let is_admin = member.role == "admin";
+
+    // 2. 查使用者所屬的 groups
+    let groups: Vec<String> = sqlx::query_scalar!(
+        "SELECT group_ FROM usr_to_group WHERE workspace_id = $1 AND email = $2",
+        workspace_id, claims.email
+    ).fetch_all(&db).await?;
+
+    // 3. 建立權限主體列表
+    let mut perm_subjects = vec![format!("u/{}", claims.email)];
+    for g in &groups {
+        perm_subjects.push(format!("g/{}", g));
+    }
+
+    // 4. 查所有 folder 的 extra_perms，找出此使用者可存取的 folders
+    //    SQL: 展開 extra_perms JSONB，比對 perm_subjects
+    let folder_rows = sqlx::query!(
+        r#"SELECT f.name, perm.key, perm.value::text as access
+           FROM folder f,
+           LATERAL jsonb_each(f.extra_perms) AS perm(key, value)
+           WHERE f.workspace_id = $1
+             AND perm.key = ANY($2)
+           UNION
+           SELECT f.name, unnest(f.owners), 'true'
+           FROM folder f
+           WHERE f.workspace_id = $1
+             AND f.owners && $2"#,
+        workspace_id, &perm_subjects
+    ).fetch_all(&db).await?;
+
+    let mut folders = HashMap::new();
+    for row in folder_rows {
+        let write = row.access.as_deref() == Some("true");
+        // 如果多個 group 都有權限，取最高權限（true > false）
+        let current = folders.entry(row.name).or_insert(false);
+        if write { *current = true; }
+    }
+
+    let user = AuthedUser {
+        email: claims.email,
+        workspace_id,
+        is_admin,
+        groups,
+        perm_subjects,
+        folders,
+    };
+
+    req.extensions_mut().insert(user);
+    Ok(next.run(req).await)
+}
 
 pub async fn login(
     State(db): State<PgPool>,
@@ -1308,6 +1903,9 @@ pub async fn create_script(
     Extension(user): Extension<AuthedUser>,
     Json(req): Json<CreateScriptRequest>,
 ) -> Result<Json<ScriptCreated>, ApiError> {
+    // 權限檢查：必須有該路徑的寫入權限
+    user.require_writer(&req.path)?;
+
     let hash = {
         let mut hasher = Sha256::new();
         hasher.update(&req.content);
@@ -1351,11 +1949,17 @@ pub async fn run_script_by_path(
     Extension(user): Extension<AuthedUser>,
     Json(args): Json<serde_json::Value>,
 ) -> Result<Json<JobCreated>, ApiError> {
+    // 權限檢查：必須有該路徑的讀取權限才能執行
+    user.require_reader(&path)?;
+
     let script = sqlx::query_as!(Script,
         "SELECT * FROM script WHERE workspace_id = $1 AND path = $2
          ORDER BY created_at DESC LIMIT 1",
         workspace_id, path
     ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+    // 從 path 推導 folder_owner（f/ml-team/xxx → "ml-team"，u/alice/xxx → NULL）
+    let folder_owner = extract_folder_owner(&path);
 
     let job_id = queue::push_job(&state.db, PushJobArgs {
         workspace_id: &workspace_id,
@@ -1365,6 +1969,7 @@ pub async fn run_script_by_path(
         language: Some(script.language),
         args: Some(args),
         tag: "default",
+        folder_owner: folder_owner.as_deref(),
         created_by: &user.email,
         trace_id: current_trace_id(),
         span_id: current_span_id(),
@@ -1372,6 +1977,15 @@ pub async fn run_script_by_path(
     }).await?;
 
     Ok(Json(JobCreated { id: job_id }))
+}
+
+/// 從路徑推導 folder owner
+/// "f/ml-team/my_script" → Some("ml-team")
+/// "u/alice/my_script" → None
+fn extract_folder_owner(path: &str) -> Option<String> {
+    path.strip_prefix("f/")
+        .and_then(|rest| rest.split('/').next())
+        .map(|s| s.to_string())
 }
 
 pub async fn run_preview(
@@ -1399,7 +2013,7 @@ pub async fn run_preview(
 
 #### 同步執行（`run_wait_result`）
 
-外部系統把 FlowForge 當 API 用的核心端點——HTTP 阻塞直到 job 完成，直接回傳結果。
+外部系統把 CoveFlow 當 API 用的核心端點——HTTP 阻塞直到 job 完成，直接回傳結果。
 
 ```rust
 // crates/api/src/jobs.rs
@@ -1818,7 +2432,7 @@ async fn main() -> anyhow::Result<()> {
     // 2. DB 連線 + Migration
     let db = sqlx::PgPool::connect(
         &std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:changeme@localhost:5432/flowforge".into())
+            .unwrap_or_else(|_| "postgres://postgres:changeme@localhost:5432/coveflow".into())
     ).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
@@ -1841,7 +2455,7 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         let sandbox = sandbox.clone();
         let tags = config.tags.clone();
-        let tracer = global::tracer("flowforge-worker");
+        let tracer = global::tracer("coveflow-worker");
         tokio::spawn(async move {
             worker::run_worker(db, format!("worker-{}", i), tags, sandbox, tracer).await;
         })
@@ -1868,7 +2482,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: flowforge
+      POSTGRES_DB: coveflow
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: changeme
     ports: ["5432:5432"]
@@ -2847,6 +3461,9 @@ pub async fn save_flow(
     Extension(user): Extension<AuthedUser>,
     Json(req): Json<SaveFlowRequest>,
 ) -> Result<Json<FlowSaved>, ApiError> {
+    // 權限檢查：必須有該路徑的寫入權限
+    user.require_writer(&path)?;
+
     // 取得目前最新 revision
     let current_rev = sqlx::query_scalar!(
         "SELECT MAX(revision) FROM flow WHERE workspace_id = $1 AND path = $2",
@@ -3073,7 +3690,7 @@ GET    /api/w/{ws}/jobs/{id}/flow_status                // 查詢 flow 執行狀
 
 ### 目標
 
-排程、大資料傳遞、內建節點——讓 Flow 成為完整的工作流系統
+排程、大資料傳遞、內建節點、部署審核、檔案儲存、集群監控——讓 Flow 成為完整的工作流系統
 
 ### 3.1 Cron 排程系統
 
@@ -3859,7 +4476,1331 @@ PUT    /api/w/{ws}/webhook_triggers/{path}/toggle    // 啟用/停用
 POST   /api/w/{ws}/webhooks/{path}                   // 觸發 job
 ```
 
-### 3.9 驗證方式
+### 3.9 Deploy Approval Gate 實作
+
+#### 核心邏輯：deploy.rs
+
+```rust
+// crates/api/src/deploy.rs
+
+use axum::{extract::*, response::Json};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// ============================================================
+// Approval Policy CRUD
+// ============================================================
+
+/// 建立審核政策
+pub async fn create_policy(
+    Path(workspace_id): Path<String>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+    Json(req): Json<CreatePolicyRequest>,
+) -> Result<Json<ApprovalPolicy>, ApiError> {
+    // 只有 admin 可以建立 policy
+    require_admin(&db, &workspace_id, &claims.email).await?;
+
+    let policy = sqlx::query_as!(ApprovalPolicy, r#"
+        INSERT INTO approval_policy (workspace_id, path_pattern, min_approvals, approvers, auto_deploy)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+    "#, workspace_id, req.path_pattern, req.min_approvals, &req.approvers, req.auto_deploy)
+    .fetch_one(&db).await?;
+
+    Ok(Json(policy))
+}
+
+/// 列出所有審核政策
+pub async fn list_policies(
+    Path(workspace_id): Path<String>,
+    State(db): State<PgPool>,
+) -> Result<Json<Vec<ApprovalPolicy>>, ApiError> {
+    let policies = sqlx::query_as!(ApprovalPolicy,
+        "SELECT * FROM approval_policy WHERE workspace_id = $1 ORDER BY path_pattern",
+        workspace_id
+    ).fetch_all(&db).await?;
+    Ok(Json(policies))
+}
+
+// ============================================================
+// Deploy Request 建立 + 查詢
+// ============================================================
+
+/// 發起部署請求
+pub async fn create_deploy_request(
+    Path(workspace_id): Path<String>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+    Json(req): Json<CreateDeployRequest>,
+) -> Result<Json<DeployRequest>, ApiError> {
+    // 1. 檢查是否有匹配的 approval_policy
+    let policy = find_matching_policy(&db, &workspace_id, &req.target_path).await?;
+
+    match policy {
+        None => {
+            // 無 policy → 直接部署（零阻力）
+            do_deploy(&db, &workspace_id, &req.target_path, &req.target_kind, &req.draft_value).await?;
+            Ok(Json(DeployRequest {
+                id: Uuid::new_v4(),
+                status: "deployed".to_string(),
+                // ... 其餘欄位
+            }))
+        }
+        Some(policy) => {
+            // 有 policy → 建立 deploy_request，等待審核
+            let previous_hash = get_current_hash(&db, &workspace_id, &req.target_path, &req.target_kind).await?;
+
+            let deploy_req = sqlx::query_as!(DeployRequest, r#"
+                INSERT INTO deploy_request
+                    (workspace_id, target_path, target_kind, draft_value, previous_hash, requested_by)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+            "#, workspace_id, req.target_path, req.target_kind,
+                req.draft_value, previous_hash, claims.email)
+            .fetch_one(&db).await?;
+
+            // 發送通知給 approvers（in-app + 可選 webhook）
+            notify_approvers(&db, &workspace_id, &policy.approvers, &deploy_req).await?;
+
+            Ok(Json(deploy_req))
+        }
+    }
+}
+
+/// 找到匹配的 approval_policy（最具體的 pattern 優先）
+async fn find_matching_policy(
+    db: &PgPool, workspace_id: &str, path: &str,
+) -> Result<Option<ApprovalPolicy>, ApiError> {
+    // 用 SQL 的 LIKE 匹配，path_pattern 中的 * 轉成 %
+    // 如果多個 pattern 都匹配，取最長的（最具體）
+    let policy = sqlx::query_as!(ApprovalPolicy, r#"
+        SELECT * FROM approval_policy
+        WHERE workspace_id = $1
+          AND $2 LIKE replace(path_pattern, '*', '%')
+        ORDER BY length(path_pattern) DESC
+        LIMIT 1
+    "#, workspace_id, path)
+    .fetch_optional(db).await?;
+    Ok(policy)
+}
+
+// ============================================================
+// 審核 + 部署
+// ============================================================
+
+/// 審核通過
+pub async fn approve_deploy(
+    Path((workspace_id, request_id)): Path<(String, Uuid)>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+    Json(req): Json<ApprovalDecision>,
+) -> Result<Json<DeployRequest>, ApiError> {
+    let deploy_req = get_deploy_request(&db, &request_id).await?;
+
+    // 檢查是否為合格的 approver
+    let policy = find_matching_policy(&db, &workspace_id, &deploy_req.target_path).await?
+        .ok_or(ApiError::BadRequest("no matching policy"))?;
+    ensure_is_approver(&db, &workspace_id, &claims.email, &policy.approvers).await?;
+
+    // 記錄 approval
+    sqlx::query!(r#"
+        INSERT INTO deploy_approval (deploy_request_id, approver, decision, comment)
+        VALUES ($1, $2, 'approved', $3)
+        ON CONFLICT (deploy_request_id, approver)
+        DO UPDATE SET decision = 'approved', comment = $3, decided_at = now()
+    "#, request_id, claims.email, req.comment.unwrap_or_default())
+    .execute(&db).await?;
+
+    // 檢查是否達到 min_approvals
+    let approval_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM deploy_approval WHERE deploy_request_id = $1 AND decision = 'approved'",
+        request_id
+    ).fetch_one(&db).await?.unwrap_or(0);
+
+    let new_status = if approval_count >= policy.min_approvals as i64 {
+        if policy.auto_deploy {
+            // 自動部署
+            do_deploy(&db, &workspace_id, &deploy_req.target_path,
+                      &deploy_req.target_kind, &deploy_req.draft_value).await?;
+            sqlx::query!(
+                "UPDATE deploy_request SET status = 'deployed', deployed_at = now() WHERE id = $1",
+                request_id
+            ).execute(&db).await?;
+            "deployed"
+        } else {
+            sqlx::query!(
+                "UPDATE deploy_request SET status = 'approved' WHERE id = $1",
+                request_id
+            ).execute(&db).await?;
+            "approved"  // 等待手動按下 deploy
+        }
+    } else {
+        "pending"
+    };
+
+    let updated = get_deploy_request(&db, &request_id).await?;
+    Ok(Json(updated))
+}
+
+/// 駁回
+pub async fn reject_deploy(
+    Path((workspace_id, request_id)): Path<(String, Uuid)>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+    Json(req): Json<ApprovalDecision>,
+) -> Result<Json<DeployRequest>, ApiError> {
+    let deploy_req = get_deploy_request(&db, &request_id).await?;
+    let policy = find_matching_policy(&db, &workspace_id, &deploy_req.target_path).await?
+        .ok_or(ApiError::BadRequest("no matching policy"))?;
+    ensure_is_approver(&db, &workspace_id, &claims.email, &policy.approvers).await?;
+
+    sqlx::query!(r#"
+        INSERT INTO deploy_approval (deploy_request_id, approver, decision, comment)
+        VALUES ($1, $2, 'rejected', $3)
+        ON CONFLICT (deploy_request_id, approver)
+        DO UPDATE SET decision = 'rejected', comment = $3, decided_at = now()
+    "#, request_id, claims.email, req.comment.unwrap_or_default())
+    .execute(&db).await?;
+
+    // 任何人 reject → 整個 request 變 rejected
+    sqlx::query!("UPDATE deploy_request SET status = 'rejected' WHERE id = $1", request_id)
+        .execute(&db).await?;
+
+    let updated = get_deploy_request(&db, &request_id).await?;
+    Ok(Json(updated))
+}
+
+/// 手動部署（status = approved 後才能呼叫）
+pub async fn execute_deploy(
+    Path((workspace_id, request_id)): Path<(String, Uuid)>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+) -> Result<Json<DeployRequest>, ApiError> {
+    let deploy_req = get_deploy_request(&db, &request_id).await?;
+
+    if deploy_req.status != "approved" {
+        return Err(ApiError::BadRequest("deploy request is not approved"));
+    }
+
+    do_deploy(&db, &workspace_id, &deploy_req.target_path,
+              &deploy_req.target_kind, &deploy_req.draft_value).await?;
+
+    sqlx::query!(
+        "UPDATE deploy_request SET status = 'deployed', deployed_at = now() WHERE id = $1",
+        request_id
+    ).execute(&db).await?;
+
+    let updated = get_deploy_request(&db, &request_id).await?;
+    Ok(Json(updated))
+}
+
+/// 查看 diff（舊版 vs 新版）
+pub async fn get_deploy_diff(
+    Path((_workspace_id, request_id)): Path<(String, Uuid)>,
+    State(db): State<PgPool>,
+) -> Result<Json<DeployDiff>, ApiError> {
+    let deploy_req = get_deploy_request(&db, &request_id).await?;
+
+    let current_value = if let Some(ref hash) = deploy_req.previous_hash {
+        // 根據 target_kind 取得舊版本內容
+        match deploy_req.target_kind.as_str() {
+            "flow" => get_flow_value_by_hash(&db, hash).await?,
+            "script" => get_script_value_by_hash(&db, hash).await?,
+            _ => None,
+        }
+    } else {
+        None  // 新建，無舊版本
+    };
+
+    Ok(Json(DeployDiff {
+        current: current_value,
+        proposed: deploy_req.draft_value.clone(),
+        target_path: deploy_req.target_path,
+        target_kind: deploy_req.target_kind,
+    }))
+}
+
+// ============================================================
+// 內部輔助
+// ============================================================
+
+/// 實際執行部署：將 draft_value 寫入正式表
+async fn do_deploy(
+    db: &PgPool, workspace_id: &str, path: &str,
+    kind: &str, value: &serde_json::Value,
+) -> Result<(), ApiError> {
+    match kind {
+        "flow" => {
+            // 呼叫 flows::save_flow 的內部邏輯（建立新 revision）
+            flows::save_flow_internal(db, workspace_id, path, value).await?;
+        }
+        "script" => {
+            // 呼叫 scripts::create_script 的內部邏輯（建立新 hash）
+            scripts::create_script_internal(db, workspace_id, path, value).await?;
+        }
+        _ => return Err(ApiError::BadRequest("invalid target_kind")),
+    }
+    Ok(())
+}
+
+/// 檢查使用者是否為合格的 approver（支援 group 展開）
+async fn ensure_is_approver(
+    db: &PgPool, workspace_id: &str, email: &str, approvers: &[String],
+) -> Result<(), ApiError> {
+    for approver in approvers {
+        if approver.starts_with("u/") && approver == format!("u/{email}") {
+            return Ok(());
+        }
+        if approver.starts_with("g/") {
+            // 查 group membership
+            let group_name = &approver[2..];
+            let is_member = sqlx::query_scalar!(
+                "SELECT EXISTS(SELECT 1 FROM usr_to_group WHERE workspace_id = $1 AND group_ = $2 AND email = $3)",
+                workspace_id, group_name, email
+            ).fetch_one(db).await?.unwrap_or(false);
+            if is_member { return Ok(()); }
+        }
+    }
+    Err(ApiError::Forbidden("you are not an approved reviewer"))
+}
+
+// ============================================================
+// 型別定義
+// ============================================================
+
+#[derive(Deserialize)]
+pub struct CreatePolicyRequest {
+    pub path_pattern: String,      // "f/production/*"
+    pub min_approvals: i32,        // 1
+    pub approvers: Vec<String>,    // ["u/alice", "g/sre-team"]
+    pub auto_deploy: Option<bool>, // 達到 min_approvals 後自動部署？
+}
+
+#[derive(Deserialize)]
+pub struct CreateDeployRequest {
+    pub target_path: String,           // "f/production/credit_scoring"
+    pub target_kind: String,           // "flow" | "script"
+    pub draft_value: serde_json::Value, // 新版本 JSON
+}
+
+#[derive(Deserialize)]
+pub struct ApprovalDecision {
+    pub comment: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DeployDiff {
+    pub current: Option<serde_json::Value>,   // 舊版（None = 新建）
+    pub proposed: serde_json::Value,          // 新版
+    pub target_path: String,
+    pub target_kind: String,
+}
+```
+
+#### Flow/Script 儲存整合
+
+既有的 `flows::save_flow` 和 `scripts::create_script` 需要加入 approval gate 檢查：
+
+```rust
+// crates/api/src/flows.rs — save_flow 修改
+
+pub async fn save_flow(
+    Path((workspace_id, path)): Path<(String, String)>,
+    State(db): State<PgPool>,
+    claims: AuthClaims,
+    Json(req): Json<SaveFlowRequest>,
+) -> Result<Json<SaveFlowResponse>, ApiError> {
+    // 檢查是否有匹配的 approval_policy
+    let policy = deploy::find_matching_policy(&db, &workspace_id, &path).await?;
+
+    match policy {
+        None => {
+            // 無 policy → 直接儲存（原有邏輯）
+            let result = save_flow_internal(&db, &workspace_id, &path, &req.value).await?;
+            Ok(Json(SaveFlowResponse { deployed: true, deploy_request_id: None, revision: result }))
+        }
+        Some(_policy) => {
+            // 有 policy → 只存 draft，不寫入正式版本
+            // 自動建立 deploy_request
+            let deploy_req = deploy::create_deploy_request_internal(
+                &db, &workspace_id, &path, "flow",
+                &req.value, &claims.email,
+            ).await?;
+            Ok(Json(SaveFlowResponse {
+                deployed: false,
+                deploy_request_id: Some(deploy_req.id),
+                revision: None,
+            }))
+        }
+    }
+}
+```
+
+#### 前端 DeployGate.svelte
+
+```
+DeployGate 面板（出現在 FlowEditor / ScriptEditor 的右側）：
+
+┌─────────────────────────────────────┐
+│ 📋 Deploy Request #abc123           │
+│                                     │
+│ Status: ⏳ Pending (1/2 approvals)  │
+│ Requested by: u/bob                 │
+│ Created: 2025-01-15 14:30           │
+│                                     │
+│ ─── Diff ───                        │
+│ ┌─────────────────────────────────┐ │
+│ │ - step_a: return x * 2         │ │
+│ │ + step_a: return x * 3         │ │
+│ │   step_b: (unchanged)          │ │
+│ └─────────────────────────────────┘ │
+│                                     │
+│ ─── Approvals ───                   │
+│ ✅ u/alice: "LGTM"                  │
+│ ⏳ g/sre-team: (waiting)            │
+│                                     │
+│ 💬 Comment:                         │
+│ ┌─────────────────────────────────┐ │
+│ │                                 │ │
+│ └─────────────────────────────────┘ │
+│                                     │
+│ [✅ Approve]  [❌ Reject]           │
+│                                     │
+│ ─── History ───                     │
+│ • #abc122 deployed 2025-01-14       │
+│ • #abc121 rejected 2025-01-13       │
+└─────────────────────────────────────┘
+
+管理者設定頁（/settings/approval-policies）：
+
+┌──────────────────────────────────────────┐
+│ Approval Policies                        │
+│                                          │
+│ ┌──────────────┬───────┬──────────────┐  │
+│ │ Path Pattern │ Min   │ Approvers    │  │
+│ ├──────────────┼───────┼──────────────┤  │
+│ │ f/prod/*     │ 2     │ g/sre-team   │  │
+│ │ f/finance/*  │ 1     │ u/alice      │  │
+│ │ f/staging/*  │ 1     │ g/dev-lead   │  │
+│ └──────────────┴───────┴──────────────┘  │
+│                                          │
+│ [+ Add Policy]                           │
+└──────────────────────────────────────────┘
+```
+
+### 3.10 File Storage 實作
+
+#### 儲存抽象層
+
+```rust
+// crates/object-store/src/lib.rs
+
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncRead;
+
+/// 雙模式檔案儲存
+pub enum FileStorage {
+    S3 { client: aws_sdk_s3::Client, bucket: String },
+    Local { base_dir: PathBuf },
+}
+
+/// 檔案參考（存在 job args JSONB 中）
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum FileRef {
+    S3 { s3: String },               // { "s3": "uploads/2025/data.csv" }
+    Local { local: String },          // { "local": "data.csv" }
+}
+
+impl FileStorage {
+    /// 從 workspace_settings 建立
+    pub async fn from_workspace(db: &PgPool, workspace_id: &str) -> Result<Self, Error> {
+        let settings = sqlx::query_as!(WorkspaceSettings,
+            "SELECT * FROM workspace_settings WHERE workspace_id = $1",
+            workspace_id
+        ).fetch_optional(db).await?;
+
+        match settings.map(|s| s.file_storage_mode.as_str()) {
+            Some("s3") => {
+                let s = settings.unwrap();
+                let config = aws_config::defaults(BehaviorVersion::latest())
+                    .endpoint_url(s.s3_endpoint.unwrap_or_default())
+                    .region(Region::new(s.s3_region.unwrap_or("us-east-1".into())))
+                    .credentials_provider(Credentials::new(
+                        decrypt(&s.s3_access_key_encrypted)?,
+                        decrypt(&s.s3_secret_key_encrypted)?,
+                        None, None, "workspace"
+                    ))
+                    .load().await;
+                Ok(Self::S3 { client: aws_sdk_s3::Client::new(&config), bucket: s.s3_bucket.unwrap() })
+            }
+            _ => {
+                let dir = settings
+                    .and_then(|s| s.local_data_dir)
+                    .unwrap_or_else(|| "/data/coveflow/files".into());
+                let base = PathBuf::from(dir).join(workspace_id);
+                tokio::fs::create_dir_all(&base).await?;
+                Ok(Self::Local { base_dir: base })
+            }
+        }
+    }
+
+    /// 上傳檔案
+    pub async fn upload(&self, path: &str, body: impl AsyncRead + Send + 'static, size: Option<u64>) -> Result<FileRef, Error> {
+        match self {
+            Self::S3 { client, bucket } => {
+                let key = format!("files/{}", path);
+                let stream = ByteStream::from_reader(body, size);
+                client.put_object().bucket(bucket).key(&key)
+                    .body(stream).send().await?;
+                Ok(FileRef::S3 { s3: key })
+            }
+            Self::Local { base_dir } => {
+                let dest = base_dir.join(path);
+                tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+                let mut file = tokio::fs::File::create(&dest).await?;
+                tokio::io::copy(&mut tokio::io::BufReader::new(body), &mut file).await?;
+                Ok(FileRef::Local { local: path.to_string() })
+            }
+        }
+    }
+
+    /// 下載到 job_dir（Worker 呼叫）
+    pub async fn download_to(&self, file_ref: &FileRef, dest: &Path) -> Result<(), Error> {
+        tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+        match (self, file_ref) {
+            (Self::S3 { client, bucket }, FileRef::S3 { s3: key }) => {
+                let resp = client.get_object().bucket(bucket).key(key).send().await?;
+                let mut file = tokio::fs::File::create(dest).await?;
+                let mut stream = resp.body.into_async_read();
+                tokio::io::copy(&mut stream, &mut file).await?;
+            }
+            (Self::Local { base_dir }, FileRef::Local { local: path }) => {
+                let src = base_dir.join(path);
+                tokio::fs::copy(&src, dest).await?;
+            }
+            _ => return Err(Error::Mismatch("file ref type doesn't match storage mode")),
+        }
+        Ok(())
+    }
+
+    /// 列出檔案
+    pub async fn list(&self, prefix: &str, limit: usize) -> Result<Vec<FileMetadata>, Error> {
+        match self {
+            Self::S3 { client, bucket } => {
+                let resp = client.list_objects_v2().bucket(bucket)
+                    .prefix(format!("files/{}", prefix))
+                    .max_keys(limit as i32)
+                    .send().await?;
+                Ok(resp.contents().iter().map(|obj| FileMetadata {
+                    path: obj.key().unwrap_or("").strip_prefix("files/").unwrap_or("").to_string(),
+                    size: obj.size().unwrap_or(0) as u64,
+                    last_modified: obj.last_modified().map(|t| t.to_string()),
+                }).collect())
+            }
+            Self::Local { base_dir } => {
+                // 遞迴列出 base_dir/prefix 下的檔案
+                list_local_files(base_dir, prefix, limit).await
+            }
+        }
+    }
+
+    /// 預覽檔案（前 N 行 / 前 N bytes）
+    pub async fn preview(&self, file_ref: &FileRef, max_bytes: usize) -> Result<FilePreview, Error> {
+        let bytes = self.read_partial(file_ref, max_bytes).await?;
+        let ext = file_ref.extension();
+
+        match ext {
+            "csv" => {
+                let mut rdr = csv::ReaderBuilder::new().from_reader(&bytes[..]);
+                let headers = rdr.headers()?.clone();
+                let rows: Vec<Vec<String>> = rdr.records().take(100)
+                    .filter_map(|r| r.ok())
+                    .map(|r| r.iter().map(|s| s.to_string()).collect())
+                    .collect();
+                Ok(FilePreview::Table { headers: headers.iter().map(|s| s.to_string()).collect(), rows })
+            }
+            "json" => {
+                let text = String::from_utf8_lossy(&bytes);
+                Ok(FilePreview::Json(text.to_string()))
+            }
+            _ => {
+                let text = String::from_utf8_lossy(&bytes[..max_bytes.min(bytes.len())]);
+                Ok(FilePreview::Text(text.to_string()))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct FileMetadata {
+    pub path: String,
+    pub size: u64,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Serialize)]
+pub enum FilePreview {
+    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+    Json(String),
+    Text(String),
+}
+```
+
+#### API 端點
+
+```rust
+// crates/api/src/files.rs
+
+/// 上傳檔案（streaming，支援大檔案）
+pub async fn upload_file(
+    Path(workspace_id): Path<String>,
+    State(state): State<AppState>,
+    Query(params): Query<UploadParams>,
+    body: axum::body::Body,
+) -> Result<Json<FileRef>, ApiError> {
+    // 檢查檔案大小限制
+    let settings = get_workspace_settings(&state.db, &workspace_id).await?;
+    if let Some(size) = params.size {
+        if size > settings.max_file_size as u64 {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "file size {} exceeds limit {}", size, settings.max_file_size
+            )));
+        }
+    }
+
+    let storage = FileStorage::from_workspace(&state.db, &workspace_id).await?;
+    let path = params.path.unwrap_or_else(|| {
+        format!("uploads/{}/{}", chrono::Utc::now().format("%Y/%m/%d"), Uuid::new_v4())
+    });
+
+    let reader = StreamReader::new(body.into_data_stream().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    }));
+
+    let file_ref = storage.upload(&path, reader, params.size).await?;
+    Ok(Json(file_ref))
+}
+
+/// 下載檔案
+pub async fn download_file(
+    Path((workspace_id, path)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let storage = FileStorage::from_workspace(&state.db, &workspace_id).await?;
+    let bytes = storage.read_full(&FileRef::from_path(&path, &storage)).await?;
+    let content_type = mime_guess::from_path(&path).first_or_octet_stream();
+    Ok(([(header::CONTENT_TYPE, content_type.to_string())], bytes))
+}
+
+/// 預覽檔案（前 100 行 or 前 64KB）
+pub async fn preview_file(
+    Path((workspace_id, path)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<FilePreview>, ApiError> {
+    let storage = FileStorage::from_workspace(&state.db, &workspace_id).await?;
+    let file_ref = FileRef::from_path(&path, &storage);
+    let preview = storage.preview(&file_ref, 65536).await?;
+    Ok(Json(preview))
+}
+
+#[derive(Deserialize)]
+pub struct UploadParams {
+    pub path: Option<String>,    // 自訂路徑，否則自動生成
+    pub size: Option<u64>,       // Content-Length（用於預檢大小限制）
+}
+```
+
+#### Worker 整合：自動解析 FileRef
+
+```rust
+// crates/worker/src/resolve_args.rs — 新增 resolve_file_refs
+
+/// 掃描 args 中的 FileRef，下載到 job_dir/input/
+pub async fn resolve_file_refs(
+    args: &mut serde_json::Value,
+    job_dir: &Path,
+    storage: &FileStorage,
+) -> Result<(), Error> {
+    let input_dir = job_dir.join("input");
+    tokio::fs::create_dir_all(&input_dir).await?;
+
+    resolve_file_refs_recursive(args, &input_dir, storage).await
+}
+
+async fn resolve_file_refs_recursive(
+    value: &mut serde_json::Value,
+    input_dir: &Path,
+    storage: &FileStorage,
+) -> Result<(), Error> {
+    match value {
+        serde_json::Value::Object(map) => {
+            // 檢查是否為 FileRef（有 "s3" 或 "local" key）
+            if let Some(file_ref) = try_parse_file_ref(map) {
+                let filename = file_ref.filename();
+                let dest = input_dir.join(&filename);
+                storage.download_to(&file_ref, &dest).await?;
+
+                // 替換為本地路徑，讓 script 直接 open()
+                *value = serde_json::json!({
+                    "path": format!("input/{}", filename),
+                    "original_ref": file_ref,
+                });
+                return Ok(());
+            }
+            // 遞迴處理子欄位
+            for (_k, v) in map.iter_mut() {
+                resolve_file_refs_recursive(v, input_dir, storage).await?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_file_refs_recursive(v, input_dir, storage).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+```
+
+#### 前端 FileUpload + FileBrowser
+
+```
+FileUpload 元件（拖拉上傳）：
+┌──────────────────────────────────────┐
+│  📁 拖拉檔案到這裡，或點擊選擇       │
+│                                      │
+│  ┌────────────────────────────────┐  │
+│  │ data.csv        45.2 MB       │  │
+│  │ ████████████████░░░░  78%     │  │
+│  └────────────────────────────────┘  │
+│  ┌────────────────────────────────┐  │
+│  │ model.pkl       12.1 MB  ✅   │  │
+│  └────────────────────────────────┘  │
+└──────────────────────────────────────┘
+
+FileBrowser 頁面（/files）：
+┌──────────────────────────────────────────────┐
+│ 📂 Files                    [Upload] [🔄]    │
+│                                              │
+│ 📂 uploads/                                  │
+│   📂 2025/01/                                │
+│     📄 data.csv          45.2 MB  2025-01-15 │
+│     📄 model.pkl         12.1 MB  2025-01-14 │
+│     📄 config.json        1.2 KB  2025-01-14 │
+│ 📂 results/                                  │
+│   📄 output_abc123.json  2.3 MB  2025-01-15  │
+│                                              │
+│ ─── Preview ───                              │
+│ ┌────────────────────────────────────────┐   │
+│ │ name  │ age │ score │ city            │   │
+│ │ Alice │ 30  │ 92.5  │ Taipei          │   │
+│ │ Bob   │ 25  │ 88.0  │ Tokyo           │   │
+│ │ ...   │ ... │ ...   │ ...             │   │
+│ │        (showing 100 of 50,000 rows)    │   │
+│ └────────────────────────────────────────┘   │
+└──────────────────────────────────────────────┘
+
+Storage 設定（/settings）：
+┌──────────────────────────────────────────────┐
+│ File Storage Settings                        │
+│                                              │
+│ Mode: ( ) Local  (•) S3                      │
+│                                              │
+│ S3 Endpoint: [http://minio:9000         ]    │
+│ Bucket:      [coveflow-files            ]    │
+│ Region:      [us-east-1                 ]    │
+│ Access Key:  [********************      ]    │
+│ Secret Key:  [********************      ]    │
+│                                              │
+│ Max File Size: [100 MB ▼]                    │
+│                                              │
+│ [Test Connection]  [Save]                    │
+└──────────────────────────────────────────────┘
+```
+
+### 3.11 Cluster Resource Dashboard 實作
+
+#### Worker 資源回報
+
+```rust
+// crates/worker/src/worker.rs — worker ping 擴充
+
+use sysinfo::System;
+use nix::sys::statvfs;
+
+/// 收集 worker 資源指標
+fn collect_worker_metrics(job_dir: &str) -> WorkerMetrics {
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+
+    // CPU 配額（cgroup v2 優先，fallback sysinfo）
+    let vcpus = read_cgroup_cpu_quota()
+        .unwrap_or_else(|| sys.cpus().len() as i32);
+
+    // 記憶體（cgroup v2 優先，fallback sysinfo）
+    let memory_total = read_cgroup_memory_limit()
+        .unwrap_or_else(|| sys.total_memory() as i64);
+    let memory_usage = read_cgroup_memory_usage()
+        .unwrap_or_else(|| sys.used_memory() as i64);
+
+    // CPU 使用率（/proc/stat delta）
+    let cpu_usage_percent = calculate_cpu_usage_percent();
+
+    // 磁碟（statvfs on job_dir）
+    let (disk_total, disk_usage) = match statvfs::statvfs(job_dir) {
+        Ok(stat) => {
+            let total = stat.blocks() * stat.block_size() as u64;
+            let avail = stat.blocks_available() * stat.block_size() as u64;
+            (total as i64, (total - avail) as i64)
+        }
+        Err(_) => (0, 0),
+    };
+
+    WorkerMetrics { vcpus, memory_total, memory_usage, cpu_usage_percent, disk_total, disk_usage }
+}
+
+fn read_cgroup_cpu_quota() -> Option<i32> {
+    // cgroup v2: /sys/fs/cgroup/cpu.max → "quota period"
+    let content = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
+    let parts: Vec<&str> = content.trim().split(' ').collect();
+    if parts[0] == "max" { return None; }
+    let quota: i64 = parts[0].parse().ok()?;
+    let period: i64 = parts[1].parse().ok()?;
+    Some((quota / period) as i32)
+}
+
+fn read_cgroup_memory_limit() -> Option<i64> {
+    // cgroup v2: /sys/fs/cgroup/memory.max
+    let content = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    if content.trim() == "max" { return None; }
+    content.trim().parse().ok()
+}
+
+fn read_cgroup_memory_usage() -> Option<i64> {
+    // cgroup v2: /sys/fs/cgroup/memory.current
+    std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?.trim().parse().ok()
+}
+
+/// Worker ping 更新（每 15 秒）
+async fn update_worker_ping(
+    db: &PgPool, worker_name: &str, job_dir: &str,
+    current_job_id: Option<Uuid>, occupancy: &OccupancyTracker,
+) {
+    let m = collect_worker_metrics(job_dir);
+    let (o15, o5, o30) = occupancy.rates();
+
+    sqlx::query!(r#"
+        INSERT INTO worker_ping
+            (worker, ping_at, vcpus, memory_total, disk_total,
+             cpu_usage_percent, memory_usage, disk_usage,
+             current_job_id, occupancy_15s, occupancy_5m, occupancy_30m)
+        VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (worker) DO UPDATE SET
+            ping_at = now(), vcpus = $2, memory_total = $3, disk_total = $4,
+            cpu_usage_percent = $5, memory_usage = $6, disk_usage = $7,
+            current_job_id = $8, occupancy_15s = $9, occupancy_5m = $10, occupancy_30m = $11
+    "#, worker_name, m.vcpus, m.memory_total, m.disk_total,
+        m.cpu_usage_percent, m.memory_usage, m.disk_usage,
+        current_job_id, o15, o5, o30)
+    .execute(db).await.ok();
+}
+```
+
+#### API 端點
+
+```rust
+// crates/api/src/cluster.rs
+
+/// 列出所有 worker 及其資源狀態
+pub async fn list_workers(
+    Path(workspace_id): Path<String>,
+    State(db): State<PgPool>,
+) -> Result<Json<Vec<WorkerInfo>>, ApiError> {
+    let workers = sqlx::query_as!(WorkerInfo, r#"
+        SELECT
+            worker, tags, ip, sandbox_mode, current_job_id, jobs_completed,
+            vcpus, memory_total, disk_total,
+            cpu_usage_percent, memory_usage, disk_usage,
+            occupancy_15s, occupancy_5m, occupancy_30m,
+            EXTRACT(EPOCH FROM (now() - ping_at))::int AS last_ping_secs,
+            CASE WHEN ping_at > now() - interval '30 seconds' THEN 'online' ELSE 'offline' END AS status
+        FROM worker_ping
+        ORDER BY worker
+    "#).fetch_all(&db).await?;
+    Ok(Json(workers))
+}
+
+/// 集群彙總
+pub async fn cluster_summary(
+    Path(workspace_id): Path<String>,
+    State(db): State<PgPool>,
+) -> Result<Json<ClusterSummary>, ApiError> {
+    let summary = sqlx::query_as!(ClusterSummary, r#"
+        SELECT
+            COUNT(*) FILTER (WHERE ping_at > now() - interval '30 seconds') AS online_workers,
+            COUNT(*) AS total_workers,
+            COALESCE(SUM(vcpus), 0) AS total_vcpus,
+            COALESCE(SUM(memory_total), 0) AS total_memory,
+            COALESCE(SUM(disk_total), 0) AS total_disk,
+            COALESCE(AVG(cpu_usage_percent), 0) AS avg_cpu_usage,
+            COALESCE(SUM(memory_usage), 0) AS total_memory_usage,
+            COALESCE(SUM(disk_usage), 0) AS total_disk_usage,
+            COUNT(current_job_id) AS active_jobs
+        FROM worker_ping
+    "#).fetch_one(&db).await?;
+    Ok(Json(summary))
+}
+
+#[derive(Serialize)]
+pub struct ClusterSummary {
+    pub online_workers: i64,
+    pub total_workers: i64,
+    pub total_vcpus: i64,
+    pub total_memory: i64,       // bytes
+    pub total_disk: i64,         // bytes
+    pub avg_cpu_usage: f32,      // %
+    pub total_memory_usage: i64, // bytes
+    pub total_disk_usage: i64,   // bytes
+    pub active_jobs: i64,
+}
+```
+
+#### 前端 Cluster Dashboard
+
+```
+ClusterDashboard 頁面（/workers）：
+
+┌──────────────────────────────────────────────────────────────┐
+│ 🖥️ Cluster Overview                    Last updated: 3s ago  │
+│                                                              │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
+│ │ Workers  │ │ CPU      │ │ Memory   │ │ Disk             │ │
+│ │ 6/8      │ │ 38%      │ │ 24/64 GB │ │ 120/500 GB       │ │
+│ │ online   │ │ avg      │ │ used     │ │ used             │ │
+│ └──────────┘ └──────────┘ └──────────┘ └──────────────────┘ │
+│                                                              │
+│ Active Jobs: 12 │ Queue Depth: 3 │ Throughput: 45 jobs/min   │
+│                                                              │
+│ ┌────────┬──────┬────────────┬────────────┬─────────┬──────┐ │
+│ │ Worker │ Tags │ CPU        │ Memory     │ Disk    │Status│ │
+│ ├────────┼──────┼────────────┼────────────┼─────────┼──────┤ │
+│ │ w-01   │ gpu  │ █████░ 62% │ ██████ 12G │ ███░ 45G│ 3/4 │ │
+│ │ w-02   │ api  │ ██░░░░ 25% │ ███░░░  6G │ █░░ 20G │ 1/4 │ │
+│ │ w-03   │ api  │ ░░░░░░  3% │ █░░░░░  2G │ █░░ 15G │idle │ │
+│ │ w-04   │ gpu  │ ████░░ 55% │ █████░ 10G │ ██░ 30G │ 2/4 │ │
+│ │ w-05   │ def  │ ███░░░ 40% │ ████░░  8G │ █░░ 18G │ 2/4 │ │
+│ │ w-06   │ def  │ █░░░░░ 12% │ ██░░░░  4G │ █░░ 12G │ 1/4 │ │
+│ │ w-07   │ def  │ ─ offline ─│────────────│─────────│ ❌  │ │
+│ │ w-08   │ def  │ ─ offline ─│────────────│─────────│ ❌  │ │
+│ └────────┴──────┴────────────┴────────────┴─────────┴──────┘ │
+│                                                              │
+│ ─── Per Tag Summary ───                                      │
+│ ┌──────┬─────────┬──────┬────────┐                           │
+│ │ Tag  │ Workers │ Jobs │ Avg CPU│                           │
+│ ├──────┼─────────┼──────┼────────┤                           │
+│ │ gpu  │ 2       │ 5    │ 58%    │                           │
+│ │ api  │ 2       │ 1    │ 14%    │                           │
+│ │ def  │ 2 (4)   │ 3    │ 26%    │                           │
+│ └──────┴─────────┴──────┴────────┘                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.12 Group + Folder + ACL + Quota 實作
+
+**核心邏輯**：團隊管理、路徑級 ACL、配額執行。Schema 已在 1.1 定義，Auth middleware 已在 1.6 整合。
+本節實作 CRUD API 和進階整合邏輯。
+
+```rust
+// crates/api/src/groups.rs
+
+use crate::auth::AuthedUser;
+
+/// 列出 workspace 中所有 group
+pub async fn list_groups(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<Json<Vec<GroupInfo>>, ApiError> {
+    let groups = sqlx::query_as!(GroupInfo,
+        r#"SELECT g.name, g.summary,
+                  (SELECT array_agg(u.email) FROM usr_to_group u
+                   WHERE u.workspace_id = g.workspace_id AND u.group_ = g.name) as "members: Vec<String>"
+           FROM group_ g
+           WHERE g.workspace_id = $1
+           ORDER BY g.name"#,
+        workspace_id
+    ).fetch_all(&state.db).await?;
+    Ok(Json(groups))
+}
+
+/// 建立 group（admin only）
+pub async fn create_group(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<CreateGroupRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("admin only".into()));
+    }
+    sqlx::query!(
+        "INSERT INTO group_ (workspace_id, name, summary) VALUES ($1, $2, $3)",
+        workspace_id, req.name, req.summary.unwrap_or_default()
+    ).execute(&state.db).await?;
+
+    // 自動建立同名 folder（團隊慣例：group "ml-team" → folder "ml-team"）
+    sqlx::query!(
+        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT DO NOTHING",
+        workspace_id, req.name, req.name,
+        &[format!("g/{}", req.name)],          // group 是 folder 的 owner
+        serde_json::json!({format!("g/{}", req.name): true}), // group 成員有讀寫權
+    ).execute(&state.db).await?;
+
+    Ok(StatusCode::CREATED)
+}
+
+/// 新增成員到 group
+pub async fn add_member(
+    State(state): State<AppState>,
+    Path((workspace_id, group_name)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<AddMemberRequest>,
+) -> Result<StatusCode, ApiError> {
+    // 只有 admin 或 group extra_perms 中有寫入權限的人可加成員
+    if !user.is_admin {
+        let group = sqlx::query!(
+            "SELECT extra_perms FROM group_ WHERE workspace_id = $1 AND name = $2",
+            workspace_id, group_name
+        ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+        let perms = group.extra_perms;
+        let can_manage = user.perm_subjects.iter().any(|subj| {
+            perms.get(subj).and_then(|v| v.as_bool()) == Some(true)
+        });
+        if !can_manage {
+            return Err(ApiError::Forbidden("no permission to manage this group".into()));
+        }
+    }
+
+    sqlx::query!(
+        "INSERT INTO usr_to_group (workspace_id, email, group_)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        workspace_id, req.email, group_name
+    ).execute(&state.db).await?;
+    Ok(StatusCode::CREATED)
+}
+
+/// 移除成員
+pub async fn remove_member(
+    State(state): State<AppState>,
+    Path((workspace_id, group_name, email)): Path<(String, String, String)>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<StatusCode, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("admin only".into()));
+    }
+    sqlx::query!(
+        "DELETE FROM usr_to_group WHERE workspace_id = $1 AND email = $2 AND group_ = $3",
+        workspace_id, email, group_name
+    ).execute(&state.db).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// crates/api/src/folders.rs
+
+/// 列出使用者可見的 folder
+pub async fn list_folders(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<Json<Vec<FolderInfo>>, ApiError> {
+    if user.is_admin {
+        // admin 看到所有 folder
+        let folders = sqlx::query_as!(FolderInfo,
+            "SELECT name, display_name, owners, extra_perms FROM folder WHERE workspace_id = $1",
+            workspace_id
+        ).fetch_all(&state.db).await?;
+        return Ok(Json(folders));
+    }
+
+    // 非 admin：只看到自己有權限的 folder（已在 auth middleware 計算好）
+    let visible_names: Vec<&String> = user.folders.keys().collect();
+    let folders = sqlx::query_as!(FolderInfo,
+        "SELECT name, display_name, owners, extra_perms FROM folder
+         WHERE workspace_id = $1 AND name = ANY($2)",
+        workspace_id, &visible_names.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+    ).fetch_all(&state.db).await?;
+    Ok(Json(folders))
+}
+
+/// 建立 folder（admin only）
+pub async fn create_folder(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<CreateFolderRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("admin only".into()));
+    }
+    sqlx::query!(
+        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms)
+         VALUES ($1, $2, $3, $4, $5)",
+        workspace_id, req.name, req.display_name.unwrap_or(req.name.clone()),
+        &req.owners.unwrap_or_default(),
+        serde_json::to_value(&req.extra_perms.unwrap_or_default())?,
+    ).execute(&state.db).await?;
+    Ok(StatusCode::CREATED)
+}
+
+/// 更新 folder ACL（owners 或 admin）
+pub async fn update_folder_acl(
+    State(state): State<AppState>,
+    Path((workspace_id, folder_name)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<UpdateFolderAclRequest>,
+) -> Result<StatusCode, ApiError> {
+    // 檢查是否為 folder owner 或 admin
+    if !user.is_admin {
+        let folder = sqlx::query!(
+            "SELECT owners FROM folder WHERE workspace_id = $1 AND name = $2",
+            workspace_id, folder_name
+        ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+
+        let is_owner = folder.owners.iter().any(|o| user.perm_subjects.contains(o));
+        if !is_owner {
+            return Err(ApiError::Forbidden("only folder owners or admins can update ACL".into()));
+        }
+    }
+
+    // 合併更新 extra_perms（不是整個覆蓋，而是 merge）
+    sqlx::query!(
+        "UPDATE folder SET extra_perms = extra_perms || $3
+         WHERE workspace_id = $1 AND name = $2",
+        workspace_id, folder_name,
+        serde_json::to_value(&req.extra_perms)?,
+    ).execute(&state.db).await?;
+    Ok(StatusCode::OK)
+}
+
+// crates/api/src/groups.rs（配額相關）
+
+/// 設定團隊配額（admin only）
+pub async fn set_quota(
+    State(state): State<AppState>,
+    Path((workspace_id, group_name)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<SetQuotaRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("admin only".into()));
+    }
+    sqlx::query!(
+        "INSERT INTO group_quota (workspace_id, group_, max_concurrent_jobs, max_daily_jobs,
+         max_storage_bytes, max_job_timeout_secs)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (workspace_id, group_) DO UPDATE SET
+           max_concurrent_jobs = EXCLUDED.max_concurrent_jobs,
+           max_daily_jobs = EXCLUDED.max_daily_jobs,
+           max_storage_bytes = EXCLUDED.max_storage_bytes,
+           max_job_timeout_secs = EXCLUDED.max_job_timeout_secs",
+        workspace_id, group_name,
+        req.max_concurrent_jobs, req.max_daily_jobs,
+        req.max_storage_bytes, req.max_job_timeout_secs,
+    ).execute(&state.db).await?;
+    Ok(StatusCode::OK)
+}
+
+/// 查詢配額使用量（admin + group member）
+pub async fn get_quota(
+    State(state): State<AppState>,
+    Path((workspace_id, group_name)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<Json<QuotaUsage>, ApiError> {
+    if !user.is_admin && !user.groups.contains(&group_name) {
+        return Err(ApiError::Forbidden("not a member of this group".into()));
+    }
+
+    let quota = sqlx::query_as!(GroupQuota,
+        "SELECT * FROM group_quota WHERE workspace_id = $1 AND group_ = $2",
+        workspace_id, group_name
+    ).fetch_optional(&state.db).await?;
+
+    // 查詢目前使用量
+    let running_jobs: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM job_queue jq
+         JOIN job j ON j.id = jq.id
+         WHERE j.workspace_id = $1 AND j.folder_owner = $2 AND jq.running = TRUE",
+        workspace_id, group_name
+    ).fetch_one(&state.db).await?.unwrap_or(0);
+
+    let today_jobs: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM job j
+         WHERE j.workspace_id = $1 AND j.folder_owner = $2
+           AND j.created_at >= CURRENT_DATE",
+        workspace_id, group_name
+    ).fetch_one(&state.db).await?.unwrap_or(0);
+
+    // 檔案儲存用量（走 File Storage API）
+    let storage_bytes: i64 = sqlx::query_scalar!(
+        "SELECT COALESCE(SUM(length(content)), 0) FROM flow_file
+         WHERE workspace_id = $1 AND flow_path LIKE $2",
+        workspace_id, format!("f/{}/%", group_name)
+    ).fetch_one(&state.db).await?.unwrap_or(0);
+
+    Ok(Json(QuotaUsage {
+        quota,
+        current_running_jobs: running_jobs,
+        current_daily_jobs: today_jobs,
+        current_storage_bytes: storage_bytes,
+    }))
+}
+```
+
+**Resource / Variable 的 Folder ACL 整合：**
+
+Resource 和 Variable 都使用 `path` 欄位（如 `f/ml-team/prod_db`），因此權限控制直接複用 `AuthedUser.can_read(path)` / `can_write(path)`。
+
+```rust
+// crates/api/src/resources.rs（部分修改）
+
+pub async fn get_resource_value(
+    State(state): State<AppState>,
+    Path((workspace_id, path)): Path<(String, String)>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 讀取加密值需要路徑讀取權限
+    user.require_reader(&path)?;
+    // ... 解密邏輯不變 ...
+}
+
+pub async fn create_resource(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+    Json(req): Json<CreateResourceRequest>,
+) -> Result<StatusCode, ApiError> {
+    // 建立資源需要路徑寫入權限
+    user.require_writer(&req.path)?;
+    // ... 建立邏輯不變 ...
+}
+```
+
+**File Storage 的團隊儲存配額：**
+
+```rust
+// crates/api/src/files.rs（部分修改）
+
+pub async fn upload_file(/* ... */) -> Result<Json<FileRef>, ApiError> {
+    // ... 既有邏輯 ...
+
+    // 團隊儲存配額檢查
+    if let Some(folder_name) = extract_folder_owner(&req.path) {
+        let quota = sqlx::query!(
+            "SELECT max_storage_bytes FROM group_quota
+             WHERE workspace_id = $1 AND group_ = $2",
+            workspace_id, folder_name
+        ).fetch_optional(&state.db).await?;
+
+        if let Some(q) = quota {
+            if let Some(max_bytes) = q.max_storage_bytes {
+                let current: i64 = get_group_storage_usage(&state.db, &workspace_id, &folder_name).await?;
+                if current + file_size as i64 > max_bytes {
+                    return Err(ApiError::PayloadTooLarge(format!(
+                        "group '{}' storage quota exceeded ({}/{} bytes)",
+                        folder_name, current, max_bytes
+                    )));
+                }
+            }
+        }
+    }
+    // ... 上傳邏輯不變 ...
+}
+```
+
+**Cluster Dashboard 的團隊資源用量視角：**
+
+```rust
+// crates/api/src/cluster.rs（新增 endpoint）
+
+/// 團隊資源用量摘要（哪個團隊用了多少 CPU 時間 / Job 數 / 儲存）
+pub async fn group_resource_usage(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Extension(user): Extension<AuthedUser>,
+) -> Result<Json<Vec<GroupResourceUsage>>, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("admin only".into()));
+    }
+
+    let usage = sqlx::query_as!(GroupResourceUsage,
+        r#"SELECT
+             j.folder_owner as "group_name!",
+             COUNT(DISTINCT j.id) as "total_jobs!: i64",
+             COUNT(DISTINCT jq.id) FILTER (WHERE jq.running = TRUE) as "running_jobs!: i64",
+             COALESCE(SUM(jc.duration_ms), 0) as "total_duration_ms!: i64",
+             COALESCE(AVG(jc.duration_ms), 0) as "avg_duration_ms!: f64"
+           FROM job j
+           LEFT JOIN job_queue jq ON jq.id = j.id
+           LEFT JOIN job_completed jc ON jc.id = j.id
+           WHERE j.workspace_id = $1
+             AND j.folder_owner IS NOT NULL
+             AND j.created_at >= now() - interval '24 hours'
+           GROUP BY j.folder_owner
+           ORDER BY "total_jobs!: i64" DESC"#,
+        workspace_id
+    ).fetch_all(&state.db).await?;
+
+    Ok(Json(usage))
+}
+```
+
+**前端 UI 設計：**
+
+```
+┌── Groups & Folders Settings ──────────────────────────────────┐
+│                                                                │
+│  ┌─ Groups ─────────────────────────────────────────────────┐  │
+│  │ [+ New Group]                                            │  │
+│  │ ┌────────────┬──────────┬─────────┬───────────────────┐  │  │
+│  │ │ Group      │ Members  │ Quota   │ Usage             │  │  │
+│  │ ├────────────┼──────────┼─────────┼───────────────────┤  │  │
+│  │ │ ml-team    │ 5        │ 10 conc │ ██████░░ 6/10     │  │  │
+│  │ │ data-eng   │ 3        │ 20 conc │ ██░░░░░░ 4/20     │  │  │
+│  │ │ sre        │ 2        │ ∞       │ █░░░░░░░ 2        │  │  │
+│  │ └────────────┴──────────┴─────────┴───────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌─ Folders (Path ACL) ─────────────────────────────────────┐  │
+│  │ [+ New Folder]                                           │  │
+│  │ ┌────────────┬──────────┬────────────────────────────┐   │  │
+│  │ │ Folder     │ Owners   │ Permissions                │   │  │
+│  │ ├────────────┼──────────┼────────────────────────────┤   │  │
+│  │ │ ml-team    │ g/sre    │ g/ml-team: RW, u/bob: R   │   │  │
+│  │ │ production │ g/sre    │ g/sre: RW, g/dev: R       │   │  │
+│  │ │ shared     │ (admin)  │ g/all: RW                 │   │  │
+│  │ └────────────┴──────────┴────────────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌─ Team Resource Usage (24h) ──────────────────────────────┐  │
+│  │ ┌────────────┬──────┬─────────┬──────────┬────────────┐  │  │
+│  │ │ Group      │ Jobs │ Running │ Avg Dur  │ Storage    │  │  │
+│  │ ├────────────┼──────┼─────────┼──────────┼────────────┤  │  │
+│  │ │ ml-team    │ 156  │ 6       │ 45.2s    │ 2.3 GB     │  │  │
+│  │ │ data-eng   │ 89   │ 4       │ 12.1s    │ 800 MB     │  │  │
+│  │ │ sre        │ 23   │ 2       │ 3.4s     │ 100 MB     │  │  │
+│  │ └────────────┴──────┴─────────┴──────────┴────────────┘  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 3.13 驗證方式
 
 ```
 1. 建立 `*/1 * * * *` 排程 → 確認每分鐘觸發
@@ -3875,6 +5816,34 @@ POST   /api/w/{ws}/webhooks/{path}                   // 觸發 job
 11. Variable: 建立 secret variable → resource 內引用 $var:path → 確認嵌套替換正確
 12. 加密驗證: 直接查 DB → 確認 value_encrypted 是亂碼（非明文）
 13. Webhook sync + resource: webhook 觸發的 job 也能正確解析 $res: 引用
+14. Deploy Gate 無 policy: f/sandbox/test flow → 直接 deploy，無需審核
+15. Deploy Gate 有 policy: 設 f/prod/* min=2 → 修改 flow → 自動建立 deploy_request
+16. Deploy Gate 審核流程: approver A approve → 仍 pending (1/2) → approver B approve → status=approved
+17. Deploy Gate 駁回: 任一 approver reject → status=rejected，附 comment
+18. Deploy Gate diff: 確認 /diff API 回傳正確的舊版 vs 新版差異
+19. Deploy Gate auto_deploy: 設 auto_deploy=true → 達到 min_approvals 後自動部署（不需手動按 deploy）
+20. File Upload S3: 設 storage_mode=s3 → 上傳 CSV → 確認 S3 有檔案 → 下載比對一致
+21. File Upload Local: 設 storage_mode=local → 上傳 JSON → 確認本地目錄有檔案
+22. File + Script: 上傳 data.csv → Script 參數引用 FileRef → 確認 Worker 自動下載到 job_dir/input/
+23. File Preview: 上傳 CSV → GET /files/preview → 確認回傳前 100 行表格資料
+24. File Size Limit: 設 max_file_size=1MB → 上傳 2MB 檔案 → 確認回傳 413
+25. Cluster Dashboard: 啟動 3 個 worker → GET /workers/list → 確認 3 個都顯示 CPU/記憶體/磁碟
+26. Cluster Summary: GET /workers/summary → 確認 total_vcpus/total_memory/total_disk 正確加總
+27. Worker Offline: 停止 1 個 worker → 等 30 秒 → 確認 status 變 offline
+28. Sandbox Disk Limit: nsjail tmpfs_size=50MB → 寫 100MB → 確認 ENOSPC 錯誤
+29. Group CRUD: 建立 "ml-team" group → 加成員 alice, bob → 確認 list_groups 回傳正確
+30. Folder ACL 讀寫: alice 屬 ml-team, bob 屬 data-eng → f/ml-team/ script → alice 可寫, bob 不可寫
+31. Folder ACL 唯讀: 設 g/data-eng → false（唯讀）→ bob 可讀 f/ml-team/ 的 script，但不能修改
+32. 個人路徑隔離: alice 建 u/alice/my_script → bob 無法讀取或執行
+33. Admin 無視 ACL: admin 可存取任何路徑下的 script/flow/resource
+34. 團隊並發配額: 設 ml-team max_concurrent_jobs=2 → 同時推 5 個 f/ml-team/ job → 最多 2 個同時跑
+35. 團隊每日配額: 設 ml-team max_daily_jobs=10 → 跑到第 11 個 → 確認被拒絕
+36. 配額使用量 API: GET /group_quotas/ml-team → 確認 current_running_jobs + current_daily_jobs 正確
+37. 自動建 folder: 建立 group "sre" → 確認 folder "sre" 自動建立且 g/sre 有讀寫權
+38. Resource ACL: 建 f/ml-team/prod_db resource → alice 可讀, bob（非 ml-team）不可讀
+39. File Storage 配額: 設 ml-team max_storage_bytes=100MB → 上傳 110MB → 確認被拒絕
+40. 團隊資源用量: GET /workers/group_usage → 確認每個 group 的 job 數、平均耗時、儲存量
+41. Deploy Gate + ACL: f/production/ 需審核 → 非 production folder member 無法建 deploy_request
 ```
 
 ---
@@ -4119,7 +6088,7 @@ try {
 
 每個 job 都 spawn 新子程序，冷啟動佔比高。兩種模式從一開始就設計好。
 與**同步執行模式**搭配使用時效果最大——`run_wait_result` + Dedicated Worker = **~5ms 開銷**，
-把 FlowForge 變成一個延遲媲美直接呼叫函式的 API 服務：
+把 CoveFlow 變成一個延遲媲美直接呼叫函式的 API 服務：
 
 ```
 Normal 模式：  spawn python3 → import → main() → exit    ~65ms（冷啟動 60ms + 執行 5ms）
@@ -4805,7 +6774,7 @@ impl Sandbox for K8sPodSandbox {
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {
                 "name": pod_name, "namespace": self.config.namespace,
-                "labels": { "app": "flowforge", "job-id": ctx.job_id.to_string() }
+                "labels": { "app": "coveflow", "job-id": ctx.job_id.to_string() }
             },
             "spec": {
                 "restartPolicy": "Never",
@@ -4862,7 +6831,7 @@ pub struct NsjailConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct K8sPodConfig {
-    pub namespace: String,        // "flowforge-jobs"
+    pub namespace: String,        // "coveflow-jobs"
     pub default_image: String,
     pub cpu_request: String,      // "100m"
     pub cpu_limit: String,        // "1000m"
@@ -4878,6 +6847,7 @@ pub struct K8sPodConfig {
 pub struct RustNativeConfig {
     pub memory_limit: u64,        // 1GB
     pub cpu_time_limit: u32,      // 1000s
+    pub disk_limit: Option<u64>,  // tmpfs size bytes（需 root / CAP_SYS_ADMIN）
     pub isolate_network: bool,    // false
     pub enable_landlock: bool,    // true
     pub enable_seccomp: bool,     // true
@@ -4897,7 +6867,7 @@ pub struct WasmConfig {
 ### A.6 設定檔範例
 
 ```toml
-# flowforge.toml
+# coveflow.toml
 
 [worker]
 name = "worker-01"
@@ -4907,6 +6877,7 @@ tags = ["default", "fast"]
 [worker.sandbox.rust_native]
 memory_limit = 1073741824
 cpu_time_limit = 1000
+disk_limit = 536870912            # 512MB tmpfs（需 root）
 enable_landlock = true
 enable_seccomp = true
 readonly_paths = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
@@ -4922,18 +6893,19 @@ tmpfs_size = 524288000
 [worker.sandbox.wasm]
 max_fuel = 10000000
 max_memory = 1073741824
-quickjs_module = "/opt/flowforge/quickjs.wasm"
-pyodide_module = "/opt/flowforge/pyodide.wasm"
+quickjs_module = "/opt/coveflow/quickjs.wasm"
+pyodide_module = "/opt/coveflow/pyodide.wasm"
 
 # === 模式 4：K8s Pod ===
 [worker.sandbox.k8s_pod]
-namespace = "flowforge-jobs"
-default_image = "flowforge/python-runner:3.12"
+namespace = "coveflow-jobs"
+default_image = "coveflow/python-runner:3.12"
 cpu_request = "100m"
 cpu_limit = "2000m"
 memory_request = "256Mi"
 memory_limit = "4Gi"
-service_account = "flowforge-job-runner"
+ephemeral_storage_limit = "1Gi"   # 磁碟用量上限
+service_account = "coveflow-job-runner"
 auto_cleanup = true
 
 [worker.sandbox.k8s_pod.node_selector]
@@ -4959,3 +6931,226 @@ macOS / Windows 開發環境：
   → k8s_pod（所有 job 都走 Pod）
   → 或 rust_native + seccomp（成本更低）
 ```
+
+---
+
+## Appendix B: Architecture Overview Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            CLUSTER (CoveFlow Deployment)                         │
+│                                                                                  │
+│  ┌─ Workspace ───────────────────────────────────────────────────────────────┐   │
+│  │                                                                           │   │
+│  │  ┌─ Groups (Teams) ────────────────────────────────────────────────────┐  │   │
+│  │  │  ml-team: [alice, bob]          data-eng: [charlie, dave]           │  │   │
+│  │  │       │                                │                            │  │   │
+│  │  │       ▼                                ▼                            │  │   │
+│  │  │  ┌─ Quota ──────────┐           ┌─ Quota ──────────┐                │  │   │
+│  │  │  │ max_conc: 10     │           │ max_conc: 20     │                │  │   │
+│  │  │  │ max_daily: 500   │           │ max_daily: 1000  │                │  │   │
+│  │  │  │ storage: 50GB    │           │ storage: 100GB   │                │  │   │
+│  │  │  └────────┬─────────┘           └────────┬─────────┘                │  │   │
+│  │  └───────────┼──────────────────────────────┼──────────────────────────┘  │   │
+│  │              │ quota enforcement             │                            │   │
+│  │              ▼                               ▼                            │   │
+│  │  ┌─ Folders (Path ACL) ────────────────────────────────────────────────┐  │   │
+│  │  │  f/ml-team/            f/data-eng/            f/production/         │  │   │
+│  │  │       │                      │                      │               │  │   │
+│  │  │       ▼                      ▼                      ▼               │  │   │
+│  │  │  ┌──────────┐          ┌──────────┐          ┌──────────┐           │  │   │
+│  │  │  │ Flow A   │          │ Flow C   │          │ Flow E   │           │  │   │
+│  │  │  │ Script B │          │ Script D │          │(approval)│           │  │   │
+│  │  │  └────┬─────┘          └────┬─────┘          └────┬─────┘           │  │   │
+│  │  └───────┼─────────────────────┼─────────────────────┼─────────────────┘  │   │
+│  └──────────┼─────────────────────┼─────────────────────┼────────────────────┘   │
+│             │ trigger              │                      │                      │
+│             ▼                      ▼                      ▼                      │
+│  ┌─ Job Queue (PostgreSQL FOR UPDATE SKIP LOCKED) ────────────────────────────┐  │
+│  │                                                                            │  │
+│  │  ┌─ Flow Job ──────────────────────────────┐                               │  │
+│  │  │  id: uuid-001                           │                               │  │
+│  │  │  kind: flow                             │                               │  │
+│  │  │  folder_owner: "ml-team" ───────────────────> Layer 5 quota check       │  │
+│  │  │  tag: "default"                         │                               │  │
+│  │  │  priority: 0                            │                               │  │
+│  │  │       │                                 │                               │  │
+│  │  │       │ Flow Engine expands steps       │                               │  │
+│  │  │       ▼                                 │                               │  │
+│  │  │  ┌─ Child Jobs ─────────────────────┐   │                               │  │
+│  │  │  │ Step A (script)  -> uuid-002     │   │                               │  │
+│  │  │  │ Step B (script)  -> uuid-003     │   │                               │  │
+│  │  │  │ Step C (forloop) -> uuid-004     │   │                               │  │
+│  │  │  │   ├─ iter[0] -> uuid-005         │   │                               │  │
+│  │  │  │   ├─ iter[1] -> uuid-006         │   │                               │  │
+│  │  │  │   └─ iter[2] -> uuid-007         │   │                               │  │
+│  │  │  └──────────────────────────────────┘   │                               │  │
+│  │  └─────────────────────────────────────────┘                               │  │
+│  │                                                                            │  │
+│  │  ┌── 5-Layer Concurrency Defense ──────────────────────────────────────┐   │  │
+│  │  │ L1: Physical worker count (natural limit)                           │   │  │
+│  │  │ L2: worker_config.max_concurrent_jobs (global cap)                  │   │  │
+│  │  │ L3: concurrency_limit per tag (tag-level cap)                       │   │  │
+│  │  │ L4: Worker backpressure (LISTEN/NOTIFY + poll interval)             │   │  │
+│  │  │ L5: group_quota.max_concurrent_jobs (team-level cap)  <-- NEW       │   │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘   │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│             │                                                                    │
+│             │ SELECT ... FOR UPDATE SKIP LOCKED                                  │
+│             ▼                                                                    │
+│  ┌─ Worker Pool ──────────────────────────────────────────────────────────────┐  │
+│  │                                                                            │  │
+│  │  ┌─ Worker 1 ───────────┐  ┌─ Worker 2 ───────────┐  ┌─ Worker N ──────┐   │  │
+│  │  │ tags: [default, gpu] │  │ tags: [default]      │  │ tags: [heavy]   │   │  │
+│  │  │                      │  │                      │  │                 │   │  │
+│  │  │ ┌─ Resources ──────┐ │  │ ┌─ Resources ──────┐ │  │ ┌─ Resources ─┐ │   │  │
+│  │  │ │ vCPU: 8          │ │  │ │ vCPU: 4          │ │  │ │ vCPU: 16    │ │   │  │
+│  │  │ │ RAM: 32GB        │ │  │ │ RAM: 16GB        │ │  │ │ RAM: 64GB   │ │   │  │
+│  │  │ │ Disk: 500GB      │ │  │ │ Disk: 200GB      │ │  │ │ Disk: 1TB   │ │   │  │
+│  │  │ └──────────────────┘ │  │ └──────────────────┘ │  │ └─────────────┘ │   │  │
+│  │  │                      │  │                      │  │                 │   │  │
+│  │  │ ┌─ Usage (live) ───┐ │  │ ┌─ Usage (live) ───┐ │  │                 │   │  │
+│  │  │ │ CPU: 72%         │ │  │ │ CPU: 35%         │ │  │                 │   │  │
+│  │  │ │ RAM: 24GB used   │ │  │ │ RAM: 8GB used    │ │  │                 │   │  │
+│  │  │ │ Disk: 180GB used │ │  │ │ Disk: 50GB used  │ │  │                 │   │  │
+│  │  │ │ Occupancy: 85%   │ │  │ │ Occupancy: 42%   │ │  │                 │   │  │
+│  │  │ └──────────────────┘ │  │ └──────────────────┘ │  │                 │   │  │
+│  │  │                      │  │                      │  │                 │   │  │
+│  │  │ ┌─ Sandbox ────────┐ │  │ ┌─ Sandbox ────────┐ │  │                 │   │  │
+│  │  │ │ mode: nsjail     │ │  │ │ mode: none       │ │  │                 │   │  │
+│  │  │ │ mem_limit: 4GB   │ │  │ │ (dev mode)       │ │  │                 │   │  │
+│  │  │ │ disk_limit: 1GB  │ │  │ └──────────────────┘ │  │                 │   │  │
+│  │  │ │ timeout: 300s    │ │  │                      │  │                 │   │  │
+│  │  │ └────────┬─────────┘ │  └──────────────────────┘  └─────────────────┘   │  │
+│  │  │          │            │                                                 │  │
+│  │  │          ▼            │                                                 │  │
+│  │  │  ┌─ Job Execution ──────────────────────────────────┐                   │  │
+│  │  │  │ 1. mkdir job_dir                                 │                   │  │
+│  │  │  │ 2. write code (main.py + wrapper.py)             │                   │  │
+│  │  │  │ 3. resolve dependencies (pip install, cached)    │                   │  │
+│  │  │  │ 4. resolve FileRefs ──> download from S3/local   │                   │  │
+│  │  │  │ 5. spawn process in sandbox                      │                   │  │
+│  │  │  │ 6. stream stdout/stderr ──> job_log -> SSE -> UI │                   │  │
+│  │  │  │ 7. read result.json ──> job_completed (or S3)    │                   │  │
+│  │  │  │ 8. cleanup job_dir                               │                   │  │
+│  │  │  └──────────────────────────────────────────────────┘                   │  │
+│  │  └───────────────────────┘                                                 │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+│  ┌─ Observability ────────────────────────────────────────────────────────────┐  │
+│  │  worker_ping: every 15s reports CPU/RAM/Disk/Occupancy -> Dashboard        │  │
+│  │  group_resource_usage: per-team aggregation (jobs, duration, storage)      │  │
+│  │  OTel tracing: each job = 1 span, flow children inherit parent trace_id    │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.1 Entity Relationship Summary
+
+| From | To | Cardinality | Key Field |
+|------|----|-------------|-----------|
+| Cluster | Worker | 1 : N | `worker_ping` table |
+| Workspace | Group | 1 : N | `group_.workspace_id` |
+| Group | Folder | 1 : 1 (convention) | auto-created on group create |
+| Group | Quota | 1 : 1 | `group_quota.group_` |
+| Folder | Flow / Script | 1 : N | `path` prefix `f/{folder}/` |
+| Flow | Root Job | 1 : N (per trigger) | `job.kind = flow` |
+| Root Job | Child Jobs | 1 : N (per step) | `job.parent_job` / `job.root_job` |
+| Job | Worker | N : 1 (claimed) | `job_queue.worker` |
+| Job | Team | N : 1 | `job.folder_owner` |
+| Worker | Resources | 1 : 1 | `worker_ping.vcpus / memory / disk` |
+| Worker | Sandbox | 1 : 1 | `worker_ping.sandbox_mode` |
+| Team Quota | Job Queue | throttle | Layer 5 in `push_job` + `pull_job` |
+
+### B.2 FAQ: Resource Model Clarifications
+
+**Q: What is the Job Queue?**
+
+Not a separate process. It is a PostgreSQL table (`job_queue`).
+
+```
+┌───────────────────────────────────────────────────┐
+│ There is NO separate queue process (no Redis,     │
+│ no RabbitMQ, no Kafka).                           │
+│                                                   │
+│ "Job Queue" = job_queue TABLE in PostgreSQL       │
+│                                                   │
+│ API Server:  INSERT INTO job_queue  (push)        │
+│                    │                              │
+│                    │  same PostgreSQL instance     │
+│                    ▼                              │
+│ Worker:      SELECT ... FOR UPDATE SKIP LOCKED    │
+│              (pull, atomic, no race condition)     │
+│                                                   │
+│ + LISTEN/NOTIFY for instant wakeup (<1ms latency) │
+└───────────────────────────────────────────────────┘
+```
+
+**Q: Who defines worker resources (vCPU, RAM, Disk)?**
+
+The deployment environment, not the application. Workers auto-detect on startup.
+
+```
+┌─ Who defines what ────────────────────────────────────────┐
+│                                                           │
+│ Hardware (vCPU / RAM / Disk)                              │
+│   -> Determined by whoever deploys the worker             │
+│      (docker-compose, K8s manifest, bare metal)           │
+│   -> Worker auto-detects on startup via sysinfo / cgroup  │
+│   -> Reports to worker_ping table every 15s               │
+│                                                           │
+│ Sandbox limits (per-job ceiling)                          │
+│   -> Defined in worker config (TOML)                      │
+│   -> e.g. mem_limit=4GB, timeout=300s, disk_limit=1GB     │
+│   -> Applies to EVERY job equally on that worker          │
+│                                                           │
+│ Tag routing (soft affinity, NOT ownership)                │
+│   -> Worker starts with tags: ["default", "gpu"]          │
+│   -> Job pushed with tag: "gpu"                           │
+│   -> Only workers with "gpu" tag will pick it up          │
+│   -> This is the closest to "dedicated workers"           │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Q: Does a Group own specific workers?**
+
+No. All workers are shared. Group quota only limits concurrency.
+
+```
+WRONG (Kubernetes-style mental model):
+  ml-team "owns" Worker 1, 2, 3       <- NOT how it works
+  data-eng "owns" Worker 4, 5
+
+CORRECT (CoveFlow model):
+  All 20 workers are in a shared pool.
+  Any worker can pick up any team's job.
+  group_quota.max_concurrent_jobs = 10 means:
+    -> at most 10 of ml-team's jobs run at the same time
+    -> does NOT reserve 10 workers exclusively
+
+  If ml-team has 0 running jobs, all 20 workers
+  are available to other teams.
+```
+
+To get dedicated workers per team (Phase 4+), use **tag routing**:
+
+```
+# Ops deploys 3 workers with team-specific tag
+worker --tags "ml-team,default"    # Worker 1-3
+
+# ml-team's jobs pushed with tag "ml-team"
+# -> only Worker 1-3 pick them up
+
+# This is Runner Groups (Phase 4.4), orthogonal to group_quota
+```
+
+**Q: Why does Group have a storage quota?**
+
+To prevent one team from filling shared storage with large files (ML models, datasets). However, if file storage uses S3/MinIO (virtually unlimited), **storage quota is low priority** — can be deferred to Phase 4+.
+
+| Quota field | Priority | Reason |
+|-------------|----------|--------|
+| `max_concurrent_jobs` | **High** | Prevents resource starvation across teams |
+| `max_daily_jobs` | Medium | Cost control, abuse prevention |
+| `max_storage_bytes` | Low | Only matters if using local disk, S3 is ~infinite |
+| `max_job_timeout_secs` | Low | Safety net, global default usually sufficient |
