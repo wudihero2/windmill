@@ -7,7 +7,7 @@
 - 即時寫 Python（未來多語言）並執行
 - DAG 工作流（like Windmill Flow）
 - 資料管線排程（like Airflow）
-- **Day 1 沙箱隔離**（四模式：Rust 原生 / nsjail / WASM / K8s Pod）
+- **Day 1 沙箱隔離**（三模式可插拔：nsjail / K8s Pod / Firecracker）
 - **Day 1 OpenTelemetry**
 - **Day 1 Flow 版本控制**（不可變 revision，可 diff / rollback）
 - **VS Code 風格多檔案編輯器**（多 Python 檔案互相引用，`main` 為入口）
@@ -25,7 +25,8 @@
 | Flow Editor | 自建 SVG（5000+ 行） | `@xyflow/svelte`（現成）+ 內嵌 Monaco tab |
 | JS 求值 | QuickJS + Deno（C 依賴） | `boa_engine`（純 Rust） |
 | 可觀測性 | 後加 OTel | Day 1 OpenTelemetry |
-| 沙箱 | nsjail only（Linux only） | **四模式**：Rust 原生 / nsjail / WASM / K8s Pod |
+| 沙箱 | nsjail only（Linux only） | **三模式可插拔**：nsjail / K8s Pod / Firecracker（Sandbox trait） |
+| Worker 資源模型 | 1 worker = 1 job | **Slot 模型**：1 worker = N slots，job 按需佔用 |
 | Script Hash | `i64`（不易讀） | SHA256 hex（可讀） |
 | Crate 數量 | 50+（複雜） | 6 核心（簡潔） |
 | Job 表設計 | 單表（queue + 結果混合） | 三表分離 + `LISTEN/NOTIFY` |
@@ -62,7 +63,7 @@
 | JS 求值 | `boa_engine`（純 Rust JS） | **不同於 Windmill**（QuickJS/Deno），無需 C 依賴 |
 | OTel | `opentelemetry` + `tracing` | **不同於 Windmill**，Day 1 內建 |
 | Object Storage | `aws-sdk-s3` | 大結果走 S3，與 Windmill 同 |
-| 沙箱 | Landlock+seccomp / nsjail / WASM / K8s Pod | **不同於 Windmill**（只有 nsjail），Day 1 四模式 |
+| 沙箱 | nsjail / K8s Pod / Firecracker（可插拔 trait） | **不同於 Windmill**（只有 nsjail），三模式 + Sandbox trait 可擴展 |
 
 ---
 
@@ -228,66 +229,106 @@ Windmill v1 把 queue 和結果放同一張表，後來 v2 才分離。我們直
 
 **問題**：Worker 數量 = 同時跑的 job 數。如果部署太多 Worker 或大量同步請求湧入，可能壓垮 DB / runtime / 外部 API。
 
-**三層防禦**：
+**六層防禦**（含 Slot 模型）：
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ Layer 1：Worker 數量（部署層）                           │
-│   每個程序 config.num_workers = N                       │
-│   → 這台機器最多同時跑 N 個 job                         │
-│   → K8s 部署：HPA 控制 replica 數 × N                  │
-├────────────────────────────────────────────────────────┤
-│ Layer 2：全域並發上限（worker_config 表）                │
-│   max_concurrent_jobs = 50                             │
-│   → 即使有 100 個 Worker，最多 50 個同時跑               │
-│   → pull_job() 檢查 running count，超過就不搶           │
-│   → 多餘的 Worker 空轉等 NOTIFY                        │
-├────────────────────────────────────────────────────────┤
-│ Layer 3：Tag 級並發上限（concurrency_limit 表）          │
-│   tag="gpu" max_concurrent=2                           │
-│   tag="external-api" max_concurrent=5                  │
-│   → pull_job() SQL 中 NOT EXISTS 子查詢過濾              │
-│   → 防止特定類型 job 吃光所有 worker                     │
-├────────────────────────────────────────────────────────┤
-│ Layer 4：同步請求反壓（check_queue_too_long）            │
-│   queue_limit = 100                                    │
-│   → run_wait_result / webhook sync 專用                │
-│   → queue 太長直接 503，防止同步請求堆積                  │
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ L1: 物理 Worker 數量（部署層）                                    │
+│     由部署決定（docker replicas, K8s replicas）                   │
+├────────────────────────────────────────────────────────────────┤
+│ L2: 全域 max_concurrent_jobs（worker_config 表）                 │
+│     整個叢集的硬上限                                              │
+│     → pull_job() 檢查 running count，超過就不搶                  │
+├────────────────────────────────────────────────────────────────┤
+│ L3: Tag 級 concurrency_limit                                    │
+│     例：tag="gpu" max_concurrent=4                               │
+│     → pull_job() SQL 中 NOT EXISTS 子查詢過濾                     │
+├────────────────────────────────────────────────────────────────┤
+│ L4: Worker 反壓（LISTEN/NOTIFY + poll 間隔）                     │
+│     Worker 有容量才拉取                                          │
+├────────────────────────────────────────────────────────────────┤
+│ L5: 團隊配額（group_quota.max_concurrent_jobs）                  │
+│     每個團隊的併發 job 上限                                       │
+├────────────────────────────────────────────────────────────────┤
+│ L6: Worker Slot 可用性                                          │
+│     pull_job WHERE slots_required <= available_slots              │
+│     確保 job 物理上能塞進該 Worker                                │
+│                                                                  │
+│     Normal：       每 job acquire(N)，完成即歸還                   │
+│     Dedicated：    啟動時 acquire(1)，持有到關閉                    │
+│     Runner Group： 啟動時 acquire(max_conc)，持有到閒置回收         │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 **Windmill 的做法**：只有 Layer 1（每 worker 跑一個 job，部署幾個 worker = 幾個 slot）+ 部分 Layer 4（`QUEUE_LIMIT_WAIT_RESULT`）。
-我們增加 Layer 2（全域上限）和 Layer 3（tag 級限制），更精細的控制。
+我們增加 L2（全域上限）、L3（tag 級限制）、L5（團隊配額）、L6（Slot 物理約束），更精細的控制。
 
-### Sandbox 四模式策略
+### Sandbox 三模式策略（可插拔 Trait）
 
-Windmill 的 nsjail 是**後加的**，導致每個 executor 都有 `if is_sandboxing_enabled()` 的分支邏輯。我們的做法：**Sandbox 是 trait，所有執行都經過它**。
+Windmill 的 nsjail 是**後加的**，導致每個 executor 都有 `if is_sandboxing_enabled()` 的分支邏輯。我們的做法：**Sandbox 是 trait，所有執行都經過它**。新模式只需實作 trait 即可。
 
-| 面向 | Rust 原生 (Landlock+seccomp) | nsjail | WASM (wasmtime) | K8s Pod |
-|------|---------------------------|--------|----------------|---------|
-| **啟動延遲** | ~1-5ms | ~10-50ms | **~5μs - 1ms** | ~2-10s |
-| **效能開銷** | ~0% | ~0% | ~10-15% slower | ~0%（容器內） |
-| **跨平台** | Linux only | Linux only | **全平台** | 任何有 K8s 的環境 |
-| **任意 pip 包** | **支援** | **支援** | 僅 Pyodide 內建 | **支援** |
-| **Bash 執行** | **支援** | **支援** | 不支援 | **支援** |
-| **GPU** | 不支援 | 不支援 | 不支援 | **K8s 原生** |
-| **外部依賴** | 無（純 Rust crate） | nsjail binary (C++) | 無（純 Rust crate） | K8s cluster |
-| **磁碟限制** | tmpfs（需 root） | tmpfs_size ✅ | 虛擬 FS ✅ | ephemeral-storage ✅ |
-| **安全等級** | 高（多層防禦） | 高 | **最高**（記憶體安全） | 最高 |
+| 面向 | nsjail | K8s Pod | Firecracker（Phase 4+） |
+|------|--------|---------|----------------------|
+| **啟動延遲** | ~10-50ms | ~2-10s | ~125ms |
+| **效能開銷** | ~0% | ~0%（容器內） | ~0%（microVM） |
+| **跨平台** | Linux only | 任何有 K8s 的環境 | Linux only |
+| **任意 pip 包** | **支援** | **支援** | **支援** |
+| **Bash 執行** | **支援** | **支援** | **支援** |
+| **GPU** | 不支援 | **K8s 原生** | 可設定直通 |
+| **外部依賴** | nsjail binary (C++) | K8s cluster | Firecracker binary |
+| **磁碟限制** | tmpfs_size ✅ | ephemeral-storage ✅ | virtio-blk ✅ |
+| **隔離等級** | 高（cgroup + namespace） | 最高（container） | 最高（硬體虛擬化） |
+| **適用場景** | VM/Bare Metal 生產環境 | K8s 叢集、重型/GPU job | 多租戶 SaaS、最強隔離 |
+
+**Phase 1-3 專注 nsjail + None（開發）。Phase 3+ 加入 K8s Pod。Phase 4+ 加入 Firecracker。**
 
 **按 Job 類型選擇：**
 
 ```
-Python (任意 pip 包)        → Rust 原生 / nsjail
-Python (純運算 + pandas)    → WASM（最快啟動）
-JavaScript/TypeScript       → WASM（QuickJS，微秒級）
-Bash                        → Rust 原生 / nsjail
+Python / Bash（VM 環境）    → nsjail（預設）
 需要自訂 Docker image       → K8s Pod
 需要 GPU                    → K8s Pod
-macOS 開發環境              → WASM / None
+多租戶 SaaS（最強隔離）      → Firecracker（Phase 4+）
+macOS 開發環境              → None（不隔離）
 ```
 
-四種模式的詳細實作程式碼見[附錄 A](#附錄-a-sandbox-四模式詳細實作)。
+三種模式的詳細實作程式碼見[附錄 A](#附錄-a-sandbox-三模式詳細實作)。
+
+### Slot 資源模型
+
+**問題**：傳統的「1 worker = 1 job」模型（Windmill 的做法）在小任務上浪費大量資源。一台 8 vCPU 的機器跑一個只需 2 vCPU 的 job，75% 的算力閒置。
+
+**解法**：**Slot 模型** — 把 Worker 切成 N 個 slot，每個 slot 是最小資源分配單位。
+
+```
+Worker（8 vCPU, 32GB RAM）
+  total_slots: 4
+  per_slot: 2 vCPU, 8GB RAM, 10GB disk
+
+  ┌──────────────────────────────────────────────────┐
+  │ Slot 0       Slot 1       Slot 2       Slot 3    │
+  │ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ │
+  │ │ 2 vCPU  │ │ 2 vCPU  │ │ 2 vCPU  │ │ (free)  │ │
+  │ │ 8GB RAM │ │ 8GB RAM │ │ 8GB RAM │ │         │ │
+  │ │ Job A   │ │ Job B   │ │ Job C   │ │ avail.  │ │
+  │ │ Normal  │ │ Normal  │ │ Dedicat.│ │         │ │
+  │ └─────────┘ └─────────┘ └─────────┘ └─────────┘ │
+  └──────────────────────────────────────────────────┘
+```
+
+**Slot × 執行模式 — 正交設計**：Slot 管「資源分配」，執行模式管「程序生命週期」。
+
+```
+模式             佔用 Slot 數      每 job 有 sandbox？  冷啟動
+──────────────── ───────────────── ─────────────────── ──────────
+Normal           N（可設定）         有（獨立隔離）       ~65ms
+Dedicated 1:1    1（預留）           無（同一程序）       ~5ms
+Runner Group     max_conc（預留）    無（同一程序）       ~5ms
+```
+
+**漸進式導入**：Phase 1-3 設 `slots=1`（與「1 worker = 1 job」等價），但 SlotManager 已存在於程式碼中。Phase 3+ 啟用多 slot。Phase 4 加入 Dedicated/Runner Group。
+
+詳細的 SlotManager 實作、pull_job 整合、6 層併發控制見下方各 Phase 的實作節。
 
 ### Script SHA256 版本控制
 
@@ -827,6 +868,8 @@ CREATE TABLE job (
     root_job UUID,                     -- flow 的 root job
     flow_step_id VARCHAR(50),          -- 在 flow 中的步驟 ID
     flow_revision INTEGER,              -- 執行時的 flow 版本（可追溯）
+    -- Slot 資源需求
+    slots_required SMALLINT NOT NULL DEFAULT 1,  -- 此 job 需要幾個 slot（預設 1）
     -- 團隊歸屬（從 script/flow path 自動推導）
     folder_owner VARCHAR(100),           -- NULL（個人 u/...）或 folder 名（f/ml-team/...）
     created_by VARCHAR(255) NOT NULL,
@@ -1034,6 +1077,11 @@ CREATE TABLE worker_ping (
     sandbox_mode VARCHAR(20),       -- "nsjail", "k8s", "none"
     current_job_id UUID,            -- 正在跑的 job（NULL = 閒置）
     jobs_completed INTEGER DEFAULT 0, -- 累計完成數（監控用）
+    -- Slot 資源模型
+    total_slots SMALLINT,           -- 此 Worker 的 slot 總數
+    used_slots SMALLINT,            -- 目前已佔用的 slot 數
+    slot_cpus REAL,                 -- 每 slot 的 vCPU 數
+    slot_memory BIGINT,             -- 每 slot 的 bytes
     -- 資源配額（靜態，啟動時偵測）
     vcpus INTEGER,                  -- vCPU 數（cgroup quota / sysinfo）
     memory_total BIGINT,            -- 總記憶體 bytes（cgroup limit / meminfo）
@@ -1067,35 +1115,40 @@ CREATE TABLE workspace_settings (
 );
 ```
 
-### 1.2 Sandbox Trait 設計
+### 1.2 Sandbox Trait 設計（可插拔）
 
-Executor 不需要知道用哪種沙箱，只需呼叫 `sandbox.execute(&ctx)`。完整的四模式實作見[附錄 A](#附錄-a-sandbox-四模式詳細實作)。
+Executor 不需要知道用哪種沙箱，只需呼叫 `sandbox.execute(&ctx)`。新增沙箱模式只需：(1) 實作 `Sandbox` trait，(2) 在 `SandboxRouter` 註冊。完整的三模式實作見[附錄 A](#附錄-a-sandbox-三模式詳細實作)。
 
 ```rust
 // crates/worker/src/sandbox.rs
 
 use async_trait::async_trait;
 
-/// 沙箱執行模式
+/// 沙箱執行模式（可插拔：新增模式只需加 variant + 實作 trait）
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "mode")]
 pub enum SandboxMode {
-    None,
-    RustNative(RustNativeConfig),
-    Nsjail(NsjailConfig),
-    Wasm(WasmConfig),
-    KubernetesPod(K8sPodConfig),
+    None,                              // 開發環境：不隔離
+    Nsjail(NsjailConfig),              // Phase 1：cgroup + namespace（VM/Bare Metal）
+    KubernetesPod(K8sPodConfig),       // Phase 3+：K8s Pod 級隔離
+    Firecracker(FirecrackerConfig),    // Phase 4+：microVM（多租戶 SaaS）
 }
 
 /// Sandbox trait — 所有執行器都透過這個介面執行程式碼
+/// 新增沙箱模式只需實作此 trait（Strategy Pattern）
 #[async_trait]
 pub trait Sandbox: Send + Sync {
+    /// 在沙箱中執行程式碼（核心方法）
     async fn execute(&self, ctx: &SandboxContext) -> Result<SandboxResult, SandboxError>;
+    /// 健康檢查（啟動時驗證沙箱可用）
     async fn health_check(&self) -> Result<(), SandboxError>;
+    /// 沙箱名稱（用於日誌和監控）
     fn name(&self) -> &str;
+    /// 資源限制能力（供 SlotManager 查詢）
+    fn supports_resource_limits(&self) -> bool { true }
 }
 
-/// 執行上下文
+/// 執行上下文（傳入沙箱的所有資訊）
 pub struct SandboxContext {
     pub job_id: uuid::Uuid,
     pub job_dir: String,
@@ -1106,6 +1159,16 @@ pub struct SandboxContext {
     pub language: ScriptLang,
     pub custom_image: Option<String>,
     pub trace_context: Option<TraceContext>,
+    // Slot 模型：沙箱的資源限制由 slot 大小 × slots_required 決定
+    pub resource_limits: SandboxResources,
+}
+
+/// Slot 模型提供的資源限制
+pub struct SandboxResources {
+    pub cpus: f32,         // slot.cpus × slots_required
+    pub memory: u64,       // slot.memory × slots_required (bytes)
+    pub disk: u64,         // slot.disk × slots_required (bytes)
+    pub timeout: u32,      // 最大執行秒數
 }
 
 pub struct SandboxResult {
@@ -1144,55 +1207,50 @@ impl Sandbox for NoneSandbox {
 
     async fn health_check(&self) -> Result<(), SandboxError> { Ok(()) }
     fn name(&self) -> &str { "none" }
+    fn supports_resource_limits(&self) -> bool { false }
 }
 
-/// 根據 job 的 tag + 語言選擇最佳沙箱模式
+/// 根據 job 的 tag 選擇沙箱（Strategy Pattern + Chain of Responsibility）
 pub struct SandboxRouter {
-    rust_native: Option<RustNativeSandbox>,
     nsjail: Option<NsjailSandbox>,
-    wasm: Option<WasmSandbox>,
     k8s: Option<K8sPodSandbox>,
+    firecracker: Option<FirecrackerSandbox>,  // Phase 4+
     none: NoneSandbox,
 }
 
 impl SandboxRouter {
-    /// 根據 tag + 語言選擇沙箱
+    /// 根據 tag 選擇沙箱
     ///
     /// tag 規則：
-    ///   "wasm"       → WASM（微秒級啟動，僅 JS/純 Python）
-    ///   "fast"       → Rust 原生 / nsjail（毫秒級，全語言支援）
-    ///   "heavy"/"gpu"→ K8s Pod（秒級，自訂 image/GPU）
-    ///   "none"/"dev" → 不隔離（開發用）
-    ///   預設          → 按優先級自動選擇
-    pub fn select(&self, tag: &str, language: Option<ScriptLang>) -> &dyn Sandbox {
+    ///   "nsjail"          → nsjail（VM/Bare Metal 預設）
+    ///   "heavy"/"k8s"/"gpu" → K8s Pod（秒級，自訂 image/GPU）
+    ///   "firecracker"/"fc"  → Firecracker microVM（Phase 4+）
+    ///   "none"/"dev"      → 不隔離（開發用）
+    ///   預設               → 按優先級自動選擇
+    pub fn select(&self, tag: &str, _language: Option<ScriptLang>) -> &dyn Sandbox {
         match tag {
-            "wasm" => {
-                if matches!(language, Some(ScriptLang::TypeScript) | Some(ScriptLang::Python3)) {
-                    if let Some(wasm) = &self.wasm { return wasm as &dyn Sandbox; }
-                }
-                self.select_default()
-            }
-            "fast" | "native" => {
-                self.rust_native.as_ref().map(|s| s as &dyn Sandbox)
-                    .or_else(|| self.nsjail.as_ref().map(|s| s as &dyn Sandbox))
-                    .unwrap_or(&self.none)
-            }
             "nsjail" => self.nsjail.as_ref().map(|s| s as &dyn Sandbox).unwrap_or(&self.none),
             "heavy" | "k8s" | "gpu" => self.k8s.as_ref().map(|s| s as &dyn Sandbox).unwrap_or(&self.none),
+            "firecracker" | "fc" => self.firecracker.as_ref().map(|s| s as &dyn Sandbox).unwrap_or(&self.none),
             "none" | "dev" => &self.none,
             _ => self.select_default(),
         }
     }
 
-    /// 預設優先級：Rust 原生 → nsjail → WASM → K8s → none
+    /// 預設優先級：nsjail → K8s → Firecracker → none
     fn select_default(&self) -> &dyn Sandbox {
-        if let Some(rn) = &self.rust_native { rn as &dyn Sandbox }
-        else if let Some(nsjail) = &self.nsjail { nsjail as &dyn Sandbox }
-        else if let Some(wasm) = &self.wasm { wasm as &dyn Sandbox }
+        if let Some(nsjail) = &self.nsjail { nsjail as &dyn Sandbox }
         else if let Some(k8s) = &self.k8s { k8s as &dyn Sandbox }
+        else if let Some(fc) = &self.firecracker { fc as &dyn Sandbox }
         else { &self.none }
     }
 }
+
+// 未來擴展只需：
+// 1. 新增 SandboxMode variant（例 SandboxMode::Gvisor）
+// 2. 實作 Sandbox trait for GvisorSandbox
+// 3. 在 SandboxRouter 加一個 field + match arm
+// 不需修改任何 executor 程式碼
 ```
 
 **Executor 使用 Sandbox 的方式**（完全不知道用哪種沙箱）：
@@ -1333,11 +1391,12 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
 
 // crates/queue/src/pull.rs
 
-/// FOR UPDATE SKIP LOCKED — 搶 job（含全域並發控制）
-pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result<Option<PulledJob>> {
-    // 1. 檢查全域並發上限
-    //    running_count = job_queue 中 running=TRUE 的數量
-    //    如果超過 max_concurrent_jobs，不搶（讓 Worker 閒置等待）
+/// FOR UPDATE SKIP LOCKED — 搶 job（含全域並發控制 + L6 Slot 可用性）
+/// available_slots: 此 Worker 目前可用的 slot 數（由 SlotManager 提供）
+pub async fn pull_job(
+    db: &PgPool, worker_name: &str, tags: &[String], available_slots: u32,
+) -> Result<Option<PulledJob>> {
+    // 1. L2: 檢查全域並發上限
     let global_limit = sqlx::query_scalar!(
         "SELECT max_concurrent_jobs FROM worker_config LIMIT 1"
     ).fetch_optional(db).await?.flatten();
@@ -1352,26 +1411,26 @@ pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result
         }
     }
 
-    // 2. 同時檢查 tag 級 + 團隊級並發上限
-    //    Layer 3: tag 級（concurrency_limit 表）
-    //    Layer 5: 團隊級（group_quota 表，透過 job.folder_owner JOIN）
+    // 2. L3 + L5 + L6: tag 級 + 團隊級 + Slot 可用性
     let row = sqlx::query_as!(PulledJob,
         r#"
         WITH next_job AS (
-            SELECT jq.id, jq.tag
+            SELECT jq.id, jq.tag, j.slots_required
             FROM job_queue jq
             JOIN job j ON j.id = jq.id
             WHERE jq.running = FALSE
               AND jq.scheduled_for <= now()
               AND jq.tag = ANY($1)
-              -- Layer 3: tag 級並發控制
+              -- L6: Slot 可用性（必須能塞進 Worker 的可用 slot）
+              AND j.slots_required <= $3
+              -- L3: tag 級並發控制
               AND NOT EXISTS (
                   SELECT 1 FROM concurrency_limit cl
                   WHERE cl.tag = jq.tag
                     AND (SELECT COUNT(*) FROM job_queue jq2
                          WHERE jq2.tag = jq.tag AND jq2.running = TRUE) >= cl.max_concurrent
               )
-              -- Layer 5: 團隊級並發控制（group_quota）
+              -- L5: 團隊級並發控制（group_quota）
               AND (
                   j.folder_owner IS NULL  -- 個人 job 不受團隊配額限制
                   OR NOT EXISTS (
@@ -1394,9 +1453,9 @@ pub async fn pull_job(db: &PgPool, worker_name: &str, tags: &[String]) -> Result
         SET running = TRUE, started_at = now(), worker = $2, last_ping = now()
         FROM next_job
         WHERE job_queue.id = next_job.id
-        RETURNING job_queue.id, job_queue.tag
+        RETURNING job_queue.id, job_queue.tag, next_job.slots_required
         "#,
-        tags, worker_name
+        tags, worker_name, available_slots as i32
     )
     .fetch_optional(db)
     .await?;
@@ -1452,7 +1511,82 @@ pub async fn complete_job(
 }
 ```
 
-### 1.4 Worker 主迴圈
+### 1.4 SlotManager 實作
+
+```rust
+// crates/worker/src/slot_manager.rs
+
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+
+pub struct SlotManager {
+    semaphore: Arc<Semaphore>,
+    total: u32,
+}
+
+/// RAII guard — drop 時自動歸還 slot
+pub struct SlotGuard {
+    _permits: Vec<OwnedSemaphorePermit>,
+    count: u32,
+}
+
+impl SlotManager {
+    pub fn new(total_slots: u32) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(total_slots as usize)),
+            total: total_slots,
+        }
+    }
+
+    /// 取得 N 個 slot（阻塞直到可用）
+    pub async fn acquire(&self, n: u32) -> SlotGuard {
+        let mut permits = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            permits.push(self.semaphore.clone().acquire_owned().await.unwrap());
+        }
+        SlotGuard { _permits: permits, count: n }
+    }
+
+    /// 嘗試取得 N 個 slot（非阻塞）
+    pub fn try_acquire(&self, n: u32) -> Option<SlotGuard> {
+        let mut permits = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => permits.push(p),
+                Err(_) => return None, // slot 不足
+            }
+        }
+        Some(SlotGuard { _permits: permits, count: n })
+    }
+
+    pub fn available(&self) -> u32 {
+        self.semaphore.available_permits() as u32
+    }
+
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+
+    pub async fn wait_for_release(&self) {
+        // 等到至少 1 個 slot 被歸還
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+        drop(permit); // 立即歸還，只是為了等待
+    }
+}
+
+impl SlotGuard {
+    /// 阻止自動歸還（用於 Dedicated/RunnerGroup 永久持有 slot）
+    pub fn forget(self) {
+        for permit in self._permits {
+            permit.forget(); // Semaphore permit 不會被歸還
+        }
+        std::mem::forget(self);
+    }
+}
+// SlotGuard drop 時自動歸還（RAII 模式）
+// Normal job 完成 -> guard drop -> slot 回到池中
+```
+
+### 1.5 Worker 主迴圈（整合 SlotManager）
 
 ```rust
 // crates/worker/src/worker.rs
@@ -1461,22 +1595,30 @@ use opentelemetry::trace::{Tracer, SpanKind};
 
 pub async fn run_worker(
     db: PgPool, worker_name: String, tags: Vec<String>,
+    config: WorkerConfig,
     sandbox_router: Arc<SandboxRouter>,
     tracer: opentelemetry::global::BoxedTracer,
 ) {
     let worker_dir = format!("/tmp/coveflow/{}", worker_name);
     tokio::fs::create_dir_all(&worker_dir).await.unwrap();
 
-    // 健康檢查：定期 ping
+    // 初始化 SlotManager（Phase 1-3: slots=1, Phase 3+: auto）
+    let slot_manager = SlotManager::new(config.slots);
+
+    // 健康檢查：定期 ping（含 slot 狀態回報）
     let db2 = db.clone();
     let wn = worker_name.clone();
+    let sm = slot_manager.clone();
     tokio::spawn(async move {
         loop {
             sqlx::query!(
-                "INSERT INTO worker_ping (worker, ping_at, tags)
-                 VALUES ($1, now(), $2)
-                 ON CONFLICT (worker) DO UPDATE SET ping_at = now()",
-                wn, &tags_for_ping
+                "INSERT INTO worker_ping (worker, ping_at, tags, total_slots, used_slots, slot_cpus, slot_memory)
+                 VALUES ($1, now(), $2, $3, $4, $5, $6)
+                 ON CONFLICT (worker) DO UPDATE SET
+                   ping_at = now(), total_slots = $3, used_slots = $4",
+                wn, &tags_for_ping,
+                sm.total() as i16, (sm.total() - sm.available()) as i16,
+                config.slot.cpus, config.slot.memory as i64,
             ).execute(&db2).await.ok();
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
@@ -1487,10 +1629,21 @@ pub async fn run_worker(
     listener.listen("new_job").await.unwrap();
 
     loop {
-        // 先嘗試拉 job
-        match queue::pull_job(&db, &worker_name, &tags).await {
+        // L6: 檢查 slot 可用性
+        let available = slot_manager.available();
+        if available == 0 {
+            // 所有 slot 都佔用中，等任一 job 完成
+            slot_manager.wait_for_release().await;
+            continue;
+        }
+
+        // 拉取能塞進可用 slot 的 job
+        match queue::pull_job(&db, &worker_name, &tags, available).await {
             Ok(Some(pulled)) => {
                 let job = pulled.job;
+                let slots_required = pulled.slots_required;
+                let guard = slot_manager.acquire(slots_required as u32).await;
+
                 let job_dir = format!("{}/{}", worker_dir, job.id);
                 tokio::fs::create_dir_all(&job_dir).await.unwrap();
 
@@ -1501,36 +1654,52 @@ pub async fn run_worker(
                         KeyValue::new("job.id", job.id.to_string()),
                         KeyValue::new("job.workspace", job.workspace_id.clone()),
                         KeyValue::new("job.tag", pulled.tag.clone()),
+                        KeyValue::new("job.slots_required", slots_required as i64),
                     ])
                     .start(&tracer);
                 let cx = opentelemetry::Context::current_with_span(span);
 
+                // 計算此 job 的 sandbox 資源限制（slot 大小 × slots_required）
+                let sandbox_resources = SandboxResources {
+                    cpus: config.slot.cpus * slots_required as f32,
+                    memory: config.slot.memory * slots_required as u64,
+                    disk: config.slot.disk * slots_required as u64,
+                    timeout: config.slot.timeout,
+                };
+
                 let sandbox = sandbox_router.select(&pulled.tag, None);
-                let start = std::time::Instant::now();
-                let result = handle_job(&job, &db, &job_dir, sandbox).await;
-                let duration_ms = start.elapsed().as_millis() as i32;
 
-                match result {
-                    Ok((value, mem_peak)) => {
-                        let s3_key = maybe_upload_to_s3(&value).await;
-                        queue::complete_job(&db, job.id, true, value, duration_ms, mem_peak, s3_key.as_deref()).await.ok();
-                        cx.span().set_status(opentelemetry::trace::StatusCode::Ok, "".into());
+                // 非同步執行 job（不阻塞 pull 迴圈）
+                let db_clone = db.clone();
+                tokio::spawn(async move {
+                    let start = std::time::Instant::now();
+                    let result = handle_job(&job, &db_clone, &job_dir, sandbox, &sandbox_resources).await;
+                    let duration_ms = start.elapsed().as_millis() as i32;
+
+                    match result {
+                        Ok((value, mem_peak)) => {
+                            let s3_key = maybe_upload_to_s3(&value).await;
+                            queue::complete_job(&db_clone, job.id, true, value, duration_ms, mem_peak, s3_key.as_deref()).await.ok();
+                            cx.span().set_status(opentelemetry::trace::StatusCode::Ok, "".into());
+                        }
+                        Err(e) => {
+                            let error = serde_json::json!({"error": {"message": e.to_string()}});
+                            queue::complete_job(&db_clone, job.id, false, error, duration_ms, 0, None).await.ok();
+                            cx.span().set_status(opentelemetry::trace::StatusCode::Error, e.to_string());
+                        }
                     }
-                    Err(e) => {
-                        let error = serde_json::json!({"error": {"message": e.to_string()}});
-                        queue::complete_job(&db, job.id, false, error, duration_ms, 0, None).await.ok();
-                        cx.span().set_status(opentelemetry::trace::StatusCode::Error, e.to_string());
+                    cx.span().end();
+                    tokio::fs::remove_dir_all(&job_dir).await.ok();
+
+                    // Flow child job 完成 → 通知 flow engine
+                    if let Some(parent_job) = job.parent_job {
+                        update_flow_after_job_completion(&db_clone, parent_job, job.id).await.ok();
                     }
-                }
-                cx.span().end();
-                tokio::fs::remove_dir_all(&job_dir).await.ok();
 
-                // Flow child job 完成 → 通知 flow engine
-                if let Some(parent_job) = job.parent_job {
-                    update_flow_after_job_completion(&db, parent_job, job.id).await.ok();
-                }
+                    drop(guard); // RAII: 歸還 slot 到池中
+                });
 
-                continue; // 立即嘗試拉下一個 job（不等待）
+                continue; // 立即嘗試拉下一個 job
             }
             Ok(None) => {
                 // 沒有 job → 等 NOTIFY 或 5 秒兜底
@@ -1562,7 +1731,8 @@ pub async fn run_worker(
 }
 
 async fn handle_job(
-    job: &QueuedJob, db: &PgPool, job_dir: &str, sandbox: &dyn Sandbox,
+    job: &QueuedJob, db: &PgPool, job_dir: &str,
+    sandbox: &dyn Sandbox, resources: &SandboxResources,
 ) -> Result<(serde_json::Value, i64)> {
     match job.kind.as_str() {
         "flow" | "flow_preview" => handle_flow_job(job, db, job_dir, sandbox).await,
@@ -2449,22 +2619,26 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // 5. Workers
-    let num_workers = config.num_workers.unwrap_or(4);
-    let workers: Vec<_> = (0..num_workers).map(|i| {
-        let db = db.clone();
-        let sandbox = sandbox.clone();
-        let tags = config.tags.clone();
+    // 5. Worker（Slot 模型：1 個 Worker process，N 個 slot 併發）
+    let worker_config = config.clone();
+    let db_worker = db.clone();
+    let sandbox_worker = sandbox.clone();
+    let worker_handle = tokio::spawn(async move {
         let tracer = global::tracer("coveflow-worker");
-        tokio::spawn(async move {
-            worker::run_worker(db, format!("worker-{}", i), tags, sandbox, tracer).await;
-        })
-    }).collect();
+        worker::run_worker(
+            db_worker,
+            config.worker_name.clone(),
+            config.tags.clone(),
+            worker_config,
+            sandbox_worker,
+            tracer,
+        ).await;
+    });
 
     // 6. 等待結束
     tokio::select! {
         _ = server => {},
-        _ = futures::future::join_all(workers) => {},
+        _ = worker_handle => {},
         _ = tokio::signal::ctrl_c() => { tracing::info!("Shutting down..."); }
     }
 
@@ -2528,6 +2702,94 @@ npm run dev  # http://localhost:5173
 7. 同步超時：設 timeout=1 + 放一個 sleep(5) script → 確認收到 timeout 錯誤
 8. 斷線取消：curl 發 run_wait_result 後 Ctrl+C → 確認 job 被 canceled_by='http_disconnect'
 9. 佇列反壓：設 queue_limit=2 → 同時發 5 個 sync 請求 → 後 3 個收到 503
+```
+
+### 1.11 Slot 模型部署指南
+
+**同機部署：API Server 與 Worker 的資源預留**
+
+當 API Server 和 Worker 跑在同一台機器時（`--mode all`），Worker 啟動時自動扣除預留量：
+
+```
+Worker 啟動時自動偵測可用資源：
+
+  detected_cpu = 8 vCPU          # sysinfo / cgroup
+  detected_mem = 32 GB
+
+  reserved_cpu = RESERVED_CPU    # 環境變數，預設 1
+  reserved_mem = RESERVED_MEM_MB # 環境變數，預設 1024 (MB)
+
+  available_cpu = detected_cpu - reserved_cpu  = 7
+  available_mem = detected_mem - reserved_mem  = 31 GB
+
+  slot.cpus = 2
+  slot.memory = 8 GB
+
+  auto_slots = min(7 / 2, 31 / 8) = min(3, 3) = 3
+```
+
+**各部署模式的建議值**：
+
+```
+┌─ 部署方式 ──────────────────── RESERVED_CPU ── RESERVED_MEM ──────────┐
+│                                                                        │
+│ 1. 單機 all-in-one                                                     │
+│    coveflow --mode all                     1 core       1 GB          │
+│                                                                        │
+│ 2. 單機分 process                                                      │
+│    coveflow --mode server  (PID 1001)                                  │
+│    coveflow --mode worker  (PID 1002)      1 core       1 GB          │
+│                                                                        │
+│ 3. Worker 獨立機器 / Container / Pod                                    │
+│    機器上只有 Worker，沒有 API Server       0            256 MB         │
+│                                                                        │
+│ 4. 多 Worker 同機                                                      │
+│    每個 Worker 手動設定 slots = M                                       │
+│    確保 N * M * slot.cpus <= available_cpu  0 (手動算)   256 MB (每個)  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Slot Dashboard（前端 ClusterDashboard 整合）**：
+
+```
+┌── Worker Dashboard ─────────────────────────────────────────────┐
+│                                                                  │
+│  Worker 1 (default, gpu)  [████░░░░] 2/4 slots                  │
+│    Slot 0: [Normal]     job-abc  python3  f/ml-team/predict 12s │
+│    Slot 1: [Normal]     job-def  python3  f/data/etl        45s │
+│    Slot 2: (free)                                                │
+│    Slot 3: (free)                                                │
+│                                                                  │
+│  Worker 2 (default)       [██████░░] 3/4 slots                  │
+│    Slot 0: [Dedicated]  predict_api  python3  persistent    4h  │
+│    Slot 1: [Normal]     job-ghi  typescript  u/alice/test   2s  │
+│    Slot 2: [Normal]     job-jkl  python3     f/sre/health   8s  │
+│    Slot 3: (free)                                                │
+│                                                                  │
+│  Worker 3 (heavy)         [████████] 4/4 slots  FULL            │
+│    Slot 0-3: [Normal]   job-mno  python3  f/ml/train  slots=4  │
+│                                                                  │
+│  Cluster: 12 total slots | 7 used | 5 free | 58% utilization    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**漸進式導入路徑**：
+
+```
+Phase 1-3（保持簡單）：
+  slots = 1（預設）
+  每個 Worker 一次跑 1 個 job（與傳統模型相同）
+  但 SlotManager 已存在於程式碼中（只是設為 1）
+
+Phase 3+（啟用多 slot）：
+  slots = auto（vCPUs / slot.cpus）
+  Normal job：多 job 併發，每 job 有 per-slot sandbox
+  尚無 Dedicated/Runner Group
+
+Phase 4（加入 Dedicated）：
+  Dedicated/Runner Group 啟動時預留 slot
+  剩餘 slot 供 Normal job 使用
+  完整組合矩陣可用
 ```
 
 ---
@@ -6109,11 +6371,11 @@ Runner Group： python3 常駐 + 多 script 共用同一 runtime  ~5ms + 記憶�
 
 **組合矩陣：**
 
-| 執行模型 | None | Rust Native | nsjail | WASM | K8s Pod |
-|---------|------|-------------|--------|------|---------|
-| Normal | 開發 | VM 生產 | VM 生產 | 輕量 JS | 重型/GPU |
-| Dedicated 1:1 | 開發 | VM 高頻 | VM 高頻 | 不適用 | 不適用 |
-| Runner Group | 開發 | VM 高頻 | VM 高頻 | 不適用 | 不適用 |
+| 執行模型 | None | nsjail | K8s Pod | Firecracker (Phase 4+) |
+|---------|------|--------|---------|----------------------|
+| Normal | 開發 | VM 生產 | 重型/GPU | 多租戶 SaaS |
+| Dedicated 1:1 | 開發 | VM 高頻 | 不適用 | 不適用 |
+| Runner Group | 開發 | VM 高頻 | 不適用 | 不適用 |
 
 #### Schema
 
@@ -6525,118 +6787,18 @@ flow_job (root span)
 - Event-driven CEP（時間窗口、事件關聯）
 - 更多 Trigger 類型：Kafka、MQTT、PostgreSQL CDC、S3 事件（基於 Phase 3 的 Trigger Trait 擴展）
 - App Builder（低代碼 UI）
-- Firecracker microVM 作為第五種沙箱模式（~125ms 啟動，AWS Lambda 底層技術）
+- Firecracker microVM 沙箱完整實作（Sandbox trait 已預留，Phase 4+ 實作 FirecrackerSandbox）
+- CPU Pinning（per-slot CPU affinity，NUMA 感知，ML inference 場景）
 - Marketplace（分享自訂節點和 Flow 範本）
 - Software-Defined Assets（學 Dagster，將 data lineage 做為 first-class 概念）
 
 ---
 
-## 附錄 A：Sandbox 四模式詳細實作
+## 附錄 A：Sandbox 三模式詳細實作
 
-### A.1 方案 1：Rust 原生沙箱 — Landlock + seccomp（推薦預設）
+### A.1 nsjail（Phase 1 預設）
 
-**不需要外部 binary**，純 Rust 實作，用 Linux 核心原生的安全機制：
-
-| 技術 | Crate | 作用 | Linux 版本需求 |
-|------|-------|------|--------------|
-| **Landlock** | `landlock` (v0.4) | 檔案系統 + 網路（TCP）隔離，path-based ACL | 5.13+（ABI v4 需 6.7+） |
-| **seccomp** | `seccompiler` (v0.5, rust-vmm/AWS) | 系統呼叫白名單，BPF 過濾 | 3.5+ |
-| **User Namespace** | `nix` crate | PID/Mount/Network namespace 隔離 | 3.8+ |
-
-**Landlock 範例（檔案系統隔離）：**
-
-```rust
-use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
-
-fn sandbox_filesystem(job_dir: &str) -> Result<()> {
-    let abi = ABI::V4;
-    Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))?
-        .create()?
-        .add_rule(PathBeneath::new(PathFd::new("/usr")?, AccessFs::from_read(abi)))?
-        .add_rule(PathBeneath::new(PathFd::new("/lib")?, AccessFs::from_read(abi)))?
-        .add_rule(PathBeneath::new(PathFd::new("/bin")?, AccessFs::from_read(abi)))?
-        .add_rule(PathBeneath::new(PathFd::new(job_dir)?, AccessFs::from_all(abi)))?
-        .restrict_self()?;
-    Ok(())
-}
-```
-
-**seccomp 範例（系統呼叫白名單）：**
-
-```rust
-use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, BpfProgram};
-use std::collections::BTreeMap;
-
-fn sandbox_syscalls() -> Result<()> {
-    let filter = SeccompFilter::new(
-        BTreeMap::from([
-            (libc::SYS_read, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_write, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_openat, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_close, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_mmap, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_munmap, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_brk, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_futex, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_clone3, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_socket, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_connect, vec![SeccompRule::new(vec![])?]),
-            (libc::SYS_exit_group, vec![SeccompRule::new(vec![])?]),
-        ]),
-        SeccompAction::KillProcess,
-        SeccompAction::Allow,
-        std::env::consts::ARCH.try_into()?,
-    )?;
-    let bpf: BpfProgram = filter.try_into()?;
-    seccompiler::apply_filter(&bpf)?;
-    Ok(())
-}
-```
-
-**整合成 RustNativeSandbox：**
-
-```rust
-pub struct RustNativeSandbox { config: RustNativeConfig }
-
-impl RustNativeSandbox {
-    async fn execute(&self, ctx: &SandboxContext) -> Result<SandboxResult, SandboxError> {
-        let child = unsafe { nix::unistd::fork() };
-
-        match child {
-            Ok(nix::unistd::ForkResult::Child) => {
-                nix::sched::unshare(
-                    nix::sched::CloneFlags::CLONE_NEWPID |
-                    nix::sched::CloneFlags::CLONE_NEWNS |
-                    nix::sched::CloneFlags::CLONE_NEWUSER
-                ).ok();
-                sandbox_filesystem(&ctx.job_dir).ok();
-                sandbox_syscalls().ok();
-                set_rlimits(self.config.memory_limit, self.config.cpu_time_limit);
-
-                let err = nix::unistd::execvpe(
-                    &std::ffi::CString::new(ctx.command.as_str()).unwrap(),
-                    &ctx.args.iter().map(|a| std::ffi::CString::new(a.as_str()).unwrap()).collect::<Vec<_>>(),
-                    &ctx.env.iter().map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)).unwrap()).collect::<Vec<_>>(),
-                );
-                std::process::exit(1);
-            }
-            Ok(nix::unistd::ForkResult::Parent { child: pid }) => {
-                handle_child_pid(pid, ctx.timeout_secs).await
-            }
-            Err(e) => Err(SandboxError::ForkFailed(e.to_string())),
-        }
-    }
-}
-```
-
-**優勢**：無外部依賴、啟動 ~1-5ms、效能 ~0%、用 Firecracker 同款 seccompiler crate
-
-**限制**：Linux only、需為每種語言調整 syscall 白名單
-
-### A.2 方案 2：nsjail（Windmill 使用中）
-
-見 [04-worker-executor.md](./04-worker-executor.md) 的詳細分析。
+見 [04-worker-executor.md](./04-worker-executor.md) 的詳細分析。nsjail 提供 cgroup + namespace 級隔離，是 VM/Bare Metal 部署的首選。
 
 ```rust
 pub struct NsjailSandbox { config: NsjailConfig }
@@ -6651,12 +6813,15 @@ impl Sandbox for NsjailSandbox {
             _ => return Err(SandboxError::UnsupportedLanguage(ctx.language)),
         };
 
+        // Slot 模型：用 SandboxResources 設定 cgroup 限制
         let nsjail_timeout = ctx.timeout_secs + 15;
         let config_content = template
             .replace("{JOB_DIR}", &ctx.job_dir)
             .replace("{TIMEOUT}", &nsjail_timeout.to_string())
             .replace("{CLONE_NEWUSER}", "true")
-            .replace("{TMPFS_SIZE}", &self.config.tmpfs_size.to_string());
+            .replace("{TMPFS_SIZE}", &ctx.resource_limits.disk.to_string())
+            .replace("{MEMORY_LIMIT}", &ctx.resource_limits.memory.to_string())
+            .replace("{CPU_MS_PER_SEC}", &((ctx.resource_limits.cpus * 1000.0) as u64).to_string());
 
         let config_path = format!("{}/run.config.proto", ctx.job_dir);
         tokio::fs::write(&config_path, &config_content).await?;
@@ -6695,67 +6860,7 @@ impl Sandbox for NsjailSandbox {
 }
 ```
 
-### A.3 方案 3：WASM 沙箱（wasmtime）
-
-**兩大 runtime：**
-
-| 特性 | wasmtime (Bytecode Alliance) | wasmer |
-|------|---------------------------|--------|
-| 冷啟動 | **5μs - 1ms**（AOT） | 1-10ms |
-| WASI | WASIp2 + WASIp3 | WASIX |
-| Fuel metering | 每個 operator 可配權重 | 有 |
-| 生產使用者 | Fastly, Microsoft | Shopify |
-
-**WASM 適合什麼？**
-
-| 語言 | 可行性 | 限制 |
-|------|--------|------|
-| JavaScript/TS | 可行（QuickJS/Javy → WASM） | 無 Node.js API |
-| Python（純運算） | 可行（Pyodide） | `requests` 不行 |
-| Python（任意 pip） | 不可行 | C extensions |
-| Bash | 不可行 | 需要完整 OS |
-
-```rust
-use wasmtime::*;
-
-pub struct WasmSandbox { engine: Engine, config: WasmConfig }
-
-impl WasmSandbox {
-    pub fn new(config: WasmConfig) -> Self {
-        let mut engine_config = Config::new();
-        engine_config.consume_fuel(true);
-        engine_config.wasm_component_model(true);
-        engine_config.strategy(Strategy::Cranelift);
-        Self { engine: Engine::new(&engine_config).unwrap(), config }
-    }
-
-    async fn execute_js(&self, code: &str, args: &serde_json::Value) -> Result<SandboxResult> {
-        let module = Module::from_file(&self.engine, "quickjs.wasm")?;
-        let mut store = Store::new(&self.engine, WasmState::new());
-
-        store.set_fuel(self.config.max_fuel)?;
-        store.limiter(|state| &mut state.limiter);
-
-        let wasi = WasiCtxBuilder::new()
-            .inherit_stdout().inherit_stderr()
-            .preopened_dir(&ctx.job_dir, "/tmp/job", DirPerms::all(), FilePerms::all())?
-            .build();
-
-        let instance = Linker::new(&self.engine).instantiate(&mut store, &module)?;
-        let main = instance.get_typed_func::<(i32, i32), i32>(&mut store, "eval")?;
-        let result = main.call(&mut store, (code_ptr, args_ptr))?;
-        let fuel_consumed = self.config.max_fuel - store.get_fuel()?;
-
-        Ok(SandboxResult { /* ... */ })
-    }
-}
-```
-
-**殺手級優勢**：跨平台、啟動 5μs、Fuel metering 精確、記憶體天然隔離
-
-**致命限制（2026 現狀）**：無法跑任意 pip 包、無多執行緒、不支援 Bash
-
-### A.4 方案 4：K8s Pod
+### A.2 K8s Pod（Phase 3+）
 
 ```rust
 use k8s_openapi::api::core::v1::Pod;
@@ -6768,7 +6873,11 @@ impl Sandbox for K8sPodSandbox {
     async fn execute(&self, ctx: &SandboxContext) -> Result<SandboxResult, SandboxError> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let image = ctx.custom_image.as_deref().unwrap_or(&self.config.default_image);
-        let pod_name = format!("ff-job-{}", ctx.job_id);
+        let pod_name = format!("cf-job-{}", ctx.job_id);
+
+        // Slot 模型：用 SandboxResources 設定 Pod resource limits
+        let cpu_limit = format!("{}m", (ctx.resource_limits.cpus * 1000.0) as u64);
+        let mem_limit = format!("{}Mi", ctx.resource_limits.memory / 1024 / 1024);
 
         let pod: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
@@ -6785,11 +6894,11 @@ impl Sandbox for K8sPodSandbox {
                     "env": ctx.env.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v})).collect::<Vec<_>>(),
                     "resources": {
                         "requests": { "cpu": self.config.cpu_request, "memory": self.config.memory_request },
-                        "limits": { "cpu": self.config.cpu_limit, "memory": self.config.memory_limit },
+                        "limits": { "cpu": cpu_limit, "memory": mem_limit },
                     },
                     "volumeMounts": [{ "name": "job-data", "mountPath": "/tmp/job" }]
                 }],
-                "volumes": [{ "name": "job-data", "configMap": { "name": format!("ff-job-{}", ctx.job_id) } }],
+                "volumes": [{ "name": "job-data", "configMap": { "name": format!("cf-job-{}", ctx.job_id) } }],
                 "activeDeadlineSeconds": ctx.timeout_secs as i64,
             }
         }))?;
@@ -6817,16 +6926,53 @@ impl Sandbox for K8sPodSandbox {
 }
 ```
 
-### A.5 Config 型別定義
+### A.3 Firecracker microVM（Phase 4+ Placeholder）
+
+Firecracker 是 AWS Lambda 底層使用的 microVM 技術，啟動延遲 ~125ms，提供硬體虛擬化級別的隔離。
+
+```rust
+/// Phase 4+ 才實作，目前只有 struct + trait placeholder
+pub struct FirecrackerSandbox { config: FirecrackerConfig }
+
+#[async_trait]
+impl Sandbox for FirecrackerSandbox {
+    async fn execute(&self, ctx: &SandboxContext) -> Result<SandboxResult, SandboxError> {
+        // Phase 4+ 實作：
+        // 1. 建立 microVM（firecracker API socket）
+        // 2. 設定 vCPU/memory（從 ctx.resource_limits）
+        // 3. 掛載 rootfs + job_dir（virtio-blk）
+        // 4. 啟動 VM → 執行程式碼 → 讀取結果
+        // 5. 銷毀 VM
+        Err(SandboxError::Unavailable(
+            "Firecracker sandbox not yet implemented (Phase 4+)".into()
+        ))
+    }
+
+    async fn health_check(&self) -> Result<(), SandboxError> {
+        Err(SandboxError::Unavailable("Firecracker not yet implemented".into()))
+    }
+
+    fn name(&self) -> &str { "firecracker" }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FirecrackerConfig {
+    pub firecracker_path: String,     // 預設 "firecracker"
+    pub kernel_image: String,         // vmlinux 路徑
+    pub rootfs_image: String,         // ext4 rootfs 路徑
+    pub api_socket_dir: String,       // /tmp/coveflow/fc/
+    pub vcpu_count: u32,              // 預設由 slot 決定
+    pub mem_size_mib: u32,            // 預設由 slot 決定
+}
+```
+
+### A.4 Config 型別定義
 
 ```rust
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NsjailConfig {
     pub nsjail_path: String,      // 預設 "nsjail"
-    pub memory_limit: u64,        // 預設 1GB
-    pub cpu_time_limit: u32,      // 預設 1000s
-    pub clone_newnet: bool,       // 預設 false
-    pub tmpfs_size: u64,          // 預設 500MB
+    pub clone_newnet: bool,       // 預設 false（網路隔離）
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6834,102 +6980,103 @@ pub struct K8sPodConfig {
     pub namespace: String,        // "coveflow-jobs"
     pub default_image: String,
     pub cpu_request: String,      // "100m"
-    pub cpu_limit: String,        // "1000m"
     pub memory_request: String,   // "128Mi"
-    pub memory_limit: String,     // "1Gi"
     pub service_account: Option<String>,
     pub node_selector: Option<std::collections::HashMap<String, String>>,
     pub image_pull_secrets: Vec<String>,
     pub auto_cleanup: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct RustNativeConfig {
-    pub memory_limit: u64,        // 1GB
-    pub cpu_time_limit: u32,      // 1000s
-    pub disk_limit: Option<u64>,  // tmpfs size bytes（需 root / CAP_SYS_ADMIN）
-    pub isolate_network: bool,    // false
-    pub enable_landlock: bool,    // true
-    pub enable_seccomp: bool,     // true
-    pub readonly_paths: Vec<String>,  // ["/usr", "/lib", "/bin"]
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WasmConfig {
-    pub max_fuel: u64,            // 10_000_000
-    pub max_memory: usize,        // 1GB
-    pub quickjs_module: Option<String>,
-    pub pyodide_module: Option<String>,
-    pub allow_network: bool,      // false
-}
+// NsjailConfig 不再需要 memory_limit / cpu_time_limit / tmpfs_size，
+// 這些由 Slot 模型的 SandboxResources 動態提供：
+//   ctx.resource_limits.memory  → nsjail cgroup 限制
+//   ctx.resource_limits.disk    → nsjail tmpfs_size
+//   ctx.resource_limits.cpus    → nsjail cgroup CPU quota
+//   ctx.resource_limits.timeout → nsjail timeout
 ```
 
-### A.6 設定檔範例
+### A.5 設定檔範例
 
 ```toml
 # coveflow.toml
 
 [worker]
 name = "worker-01"
-tags = ["default", "fast"]
+tags = ["default"]
 
-# === 模式 1：Rust 原生（推薦預設）===
-[worker.sandbox.rust_native]
-memory_limit = 1073741824
-cpu_time_limit = 1000
-disk_limit = 536870912            # 512MB tmpfs（需 root）
-enable_landlock = true
-enable_seccomp = true
-readonly_paths = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+# Slot 資源模型
+slots = 4                        # 總 slot 數（省略時自動偵測）
+[worker.slot]
+cpus = 2                         # 每 slot 的 vCPU 數
+memory = "8GB"                   # 每 slot 的 RAM
+disk = "10GB"                    # 每 slot 的磁碟（sandbox 限制）
+timeout = 300                    # 每 job 最大執行秒數
 
-# === 模式 2：nsjail ===
+# 同機部署時的資源預留（省略時為 0）
+[worker.reserved]
+cpu = 1                          # 預留給 API Server / OS 的 CPU
+memory_mb = 1024                 # 預留 memory (MB)
+
+# === 沙箱模式 1：nsjail（VM/Bare Metal 預設）===
 [worker.sandbox.nsjail]
 nsjail_path = "nsjail"
-memory_limit = 1073741824
-cpu_time_limit = 1000
-tmpfs_size = 524288000
+clone_newnet = false
 
-# === 模式 3：WASM ===
-[worker.sandbox.wasm]
-max_fuel = 10000000
-max_memory = 1073741824
-quickjs_module = "/opt/coveflow/quickjs.wasm"
-pyodide_module = "/opt/coveflow/pyodide.wasm"
-
-# === 模式 4：K8s Pod ===
+# === 沙箱模式 2：K8s Pod（Phase 3+）===
 [worker.sandbox.k8s_pod]
 namespace = "coveflow-jobs"
 default_image = "coveflow/python-runner:3.12"
 cpu_request = "100m"
-cpu_limit = "2000m"
 memory_request = "256Mi"
-memory_limit = "4Gi"
-ephemeral_storage_limit = "1Gi"   # 磁碟用量上限
+ephemeral_storage_limit = "1Gi"
 service_account = "coveflow-job-runner"
 auto_cleanup = true
 
 [worker.sandbox.k8s_pod.node_selector]
 "node-type" = "compute"
+
+# === 沙箱模式 3：Firecracker（Phase 4+，目前 placeholder）===
+# [worker.sandbox.firecracker]
+# firecracker_path = "firecracker"
+# kernel_image = "/opt/coveflow/vmlinux"
+# rootfs_image = "/opt/coveflow/rootfs.ext4"
 ```
 
-### A.7 各模式適用場景
+### A.6 各模式適用場景
 
 ```
-生產環境（Linux server，高吞吐）：
-  → rust_native（預設）+ k8s_pod（重型 job）
+生產環境（VM / Bare Metal）：
+  → nsjail（預設）+ k8s_pod（需要自訂 image / GPU 的 job）
 
-生產環境（Linux server，已有 nsjail）：
-  → nsjail（預設）+ k8s_pod（重型 job）
+K8s 叢集：
+  → k8s_pod（所有 job 都走 Pod，或搭配 nsjail 混合使用）
 
-Edge / Serverless（需要微秒級冷啟動）：
-  → wasm（JS/TS job）+ rust_native（Python/Bash）
+多租戶 SaaS（Phase 4+，最強隔離需求）：
+  → firecracker（硬體虛擬化，每 job 一個 microVM）
 
 macOS / Windows 開發環境：
-  → wasm（JS/TS）+ none（Python/Bash，開發時不隔離）
+  → none（不隔離，開發時直接 spawn 子程序）
+```
 
-多租戶 SaaS（最強隔離需求）：
-  → k8s_pod（所有 job 都走 Pod）
-  → 或 rust_native + seccomp（成本更低）
+### A.7 擴展新模式的步驟
+
+新增沙箱模式只需 4 步：
+
+```
+1. 新增 SandboxMode variant：
+   enum SandboxMode { ..., NewMode(NewModeConfig) }
+
+2. 實作 Sandbox trait：
+   impl Sandbox for NewModeSandbox { ... }
+
+3. 新增 Config：
+   struct NewModeConfig { ... }
+
+4. 在 SandboxRouter 加一個 field + match arm：
+   pub struct SandboxRouter { ..., new_mode: Option<NewModeSandbox> }
+   match tag { "new_mode" => ..., }
+
+不需修改任何 executor（Python/TS/Bash）程式碼。
 ```
 
 ---
@@ -6987,12 +7134,13 @@ macOS / Windows 開發環境：
 │  │  │  └──────────────────────────────────┘   │                               │  │
 │  │  └─────────────────────────────────────────┘                               │  │
 │  │                                                                            │  │
-│  │  ┌── 5-Layer Concurrency Defense ──────────────────────────────────────┐   │  │
+│  │  ┌── 6-Layer Concurrency Defense ──────────────────────────────────────┐   │  │
 │  │  │ L1: Physical worker count (natural limit)                           │   │  │
 │  │  │ L2: worker_config.max_concurrent_jobs (global cap)                  │   │  │
 │  │  │ L3: concurrency_limit per tag (tag-level cap)                       │   │  │
 │  │  │ L4: Worker backpressure (LISTEN/NOTIFY + poll interval)             │   │  │
-│  │  │ L5: group_quota.max_concurrent_jobs (team-level cap)  <-- NEW       │   │  │
+│  │  │ L5: group_quota.max_concurrent_jobs (team-level cap)                │   │  │
+│  │  │ L6: Worker Slot availability (slots_required <= available_slots)    │   │  │
 │  │  └─────────────────────────────────────────────────────────────────────┘   │  │
 │  └────────────────────────────────────────────────────────────────────────────┘  │
 │             │                                                                    │
@@ -7000,49 +7148,44 @@ macOS / Windows 開發環境：
 │             ▼                                                                    │
 │  ┌─ Worker Pool ──────────────────────────────────────────────────────────────┐  │
 │  │                                                                            │  │
-│  │  ┌─ Worker 1 ───────────┐  ┌─ Worker 2 ───────────┐  ┌─ Worker N ──────┐   │  │
-│  │  │ tags: [default, gpu] │  │ tags: [default]      │  │ tags: [heavy]   │   │  │
-│  │  │                      │  │                      │  │                 │   │  │
-│  │  │ ┌─ Resources ──────┐ │  │ ┌─ Resources ──────┐ │  │ ┌─ Resources ─┐ │   │  │
-│  │  │ │ vCPU: 8          │ │  │ │ vCPU: 4          │ │  │ │ vCPU: 16    │ │   │  │
-│  │  │ │ RAM: 32GB        │ │  │ │ RAM: 16GB        │ │  │ │ RAM: 64GB   │ │   │  │
-│  │  │ │ Disk: 500GB      │ │  │ │ Disk: 200GB      │ │  │ │ Disk: 1TB   │ │   │  │
-│  │  │ └──────────────────┘ │  │ └──────────────────┘ │  │ └─────────────┘ │   │  │
-│  │  │                      │  │                      │  │                 │   │  │
-│  │  │ ┌─ Usage (live) ───┐ │  │ ┌─ Usage (live) ───┐ │  │                 │   │  │
-│  │  │ │ CPU: 72%         │ │  │ │ CPU: 35%         │ │  │                 │   │  │
-│  │  │ │ RAM: 24GB used   │ │  │ │ RAM: 8GB used    │ │  │                 │   │  │
-│  │  │ │ Disk: 180GB used │ │  │ │ Disk: 50GB used  │ │  │                 │   │  │
-│  │  │ │ Occupancy: 85%   │ │  │ │ Occupancy: 42%   │ │  │                 │   │  │
-│  │  │ └──────────────────┘ │  │ └──────────────────┘ │  │                 │   │  │
-│  │  │                      │  │                      │  │                 │   │  │
-│  │  │ ┌─ Sandbox ────────┐ │  │ ┌─ Sandbox ────────┐ │  │                 │   │  │
-│  │  │ │ mode: nsjail     │ │  │ │ mode: none       │ │  │                 │   │  │
-│  │  │ │ mem_limit: 4GB   │ │  │ │ (dev mode)       │ │  │                 │   │  │
-│  │  │ │ disk_limit: 1GB  │ │  │ └──────────────────┘ │  │                 │   │  │
-│  │  │ │ timeout: 300s    │ │  │                      │  │                 │   │  │
-│  │  │ └────────┬─────────┘ │  └──────────────────────┘  └─────────────────┘   │  │
-│  │  │          │            │                                                 │  │
-│  │  │          ▼            │                                                 │  │
-│  │  │  ┌─ Job Execution ──────────────────────────────────┐                   │  │
-│  │  │  │ 1. mkdir job_dir                                 │                   │  │
-│  │  │  │ 2. write code (main.py + wrapper.py)             │                   │  │
-│  │  │  │ 3. resolve dependencies (pip install, cached)    │                   │  │
-│  │  │  │ 4. resolve FileRefs ──> download from S3/local   │                   │  │
-│  │  │  │ 5. spawn process in sandbox                      │                   │  │
-│  │  │  │ 6. stream stdout/stderr ──> job_log -> SSE -> UI │                   │  │
-│  │  │  │ 7. read result.json ──> job_completed (or S3)    │                   │  │
-│  │  │  │ 8. cleanup job_dir                               │                   │  │
-│  │  │  └──────────────────────────────────────────────────┘                   │  │
-│  │  └───────────────────────┘                                                 │  │
-│  └────────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                  │
-│  ┌─ Observability ────────────────────────────────────────────────────────────┐  │
-│  │  worker_ping: every 15s reports CPU/RAM/Disk/Occupancy -> Dashboard        │  │
-│  │  group_resource_usage: per-team aggregation (jobs, duration, storage)      │  │
-│  │  OTel tracing: each job = 1 span, flow children inherit parent trace_id    │  │
-│  └────────────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+│  │  ┌─ Worker 1 ────────────────────┐  ┌─ Worker 2 ───────────┐  ┌─ Worker N ──────┐  │  │
+│  │  │ tags: [default, gpu]          │  │ tags: [default]      │  │ tags: [heavy]   │  │  │
+│  │  │ slots: 4 (2cpu/8GB per slot)  │  │ slots: 2             │  │ slots: 4        │  │  │
+│  │  │                               │  │                      │  │                 │  │  │
+│  │  │ ┌─ SlotManager ────────────┐  │  │ ┌─ SlotManager ────┐ │  │                 │  │  │
+│  │  │ │ [████░░░░] 2/4 used      │  │  │ │ [██░░] 1/2 used  │ │  │                 │  │  │
+│  │  │ │ Slot 0: Job A (Normal)   │  │  │ │ Slot 0: Job D    │ │  │                 │  │  │
+│  │  │ │ Slot 1: Job B (Normal)   │  │  │ │ Slot 1: (free)   │ │  │                 │  │  │
+│  │  │ │ Slot 2: (free)           │  │  │ └──────────────────┘ │  │                 │  │  │
+│  │  │ │ Slot 3: (free)           │  │  │                      │  │                 │  │  │
+│  │  │ └──────────────────────────┘  │  │ ┌─ Sandbox ────────┐ │  │                 │  │  │
+│  │  │                               │  │ │ mode: none       │ │  │                 │  │  │
+│  │  │ ┌─ Sandbox ────────────────┐  │  │ │ (dev mode)       │ │  │                 │  │  │
+│  │  │ │ mode: nsjail             │  │  │ └──────────────────┘ │  │                 │  │  │
+│  │  │ │ resources: per-slot      │  │  └──────────────────────┘  └─────────────────┘  │  │
+│  │  │ └────────────┬─────────────┘  │                                                │  │
+│  │  │              │                 │                                                │  │
+│  │  │              ▼                 │                                                │  │
+│  │  │  ┌─ Job Execution ──────────────────────────────────┐                           │  │
+│  │  │  │ 1. SlotManager.acquire(slots_required)           │                           │  │
+│  │  │  │ 2. mkdir job_dir                                 │                           │  │
+│  │  │  │ 3. write code (main.py + wrapper.py)             │                           │  │
+│  │  │  │ 4. resolve dependencies (pip install, cached)    │                           │  │
+│  │  │  │ 5. resolve FileRefs ──> download from S3/local   │                           │  │
+│  │  │  │ 6. spawn process in sandbox (resource_limits)    │                           │  │
+│  │  │  │ 7. stream stdout/stderr ──> job_log -> SSE -> UI │                           │  │
+│  │  │  │ 8. read result.json ──> job_completed (or S3)    │                           │  │
+│  │  │  │ 9. drop(SlotGuard) -> release slots              │                           │  │
+│  │  │  └──────────────────────────────────────────────────┘                           │  │
+│  │  └────────────────────────────────┘                                                │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                          │
+│  ┌─ Observability ────────────────────────────────────────────────────────────────────┐  │
+│  │  worker_ping: every 15s reports slots (total/used) + CPU/RAM/Disk -> Dashboard     │  │
+│  │  group_resource_usage: per-team aggregation (jobs, duration, storage)              │  │
+│  │  OTel tracing: each job = 1 span, flow children inherit parent trace_id            │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### B.1 Entity Relationship Summary
@@ -7059,7 +7202,9 @@ macOS / Windows 開發環境：
 | Job | Worker | N : 1 (claimed) | `job_queue.worker` |
 | Job | Team | N : 1 | `job.folder_owner` |
 | Worker | Resources | 1 : 1 | `worker_ping.vcpus / memory / disk` |
+| Worker | Slots | 1 : N | `worker_ping.total_slots / used_slots` |
 | Worker | Sandbox | 1 : 1 | `worker_ping.sandbox_mode` |
+| Job | Slots Required | 1 : 1 | `job.slots_required` (default 1) |
 | Team Quota | Job Queue | throttle | Layer 5 in `push_job` + `pull_job` |
 
 ### B.2 FAQ: Resource Model Clarifications
