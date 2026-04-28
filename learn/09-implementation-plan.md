@@ -7098,9 +7098,15 @@ impl Sandbox for K8sPodSandbox {
         let image = ctx.custom_image.as_deref().unwrap_or(&self.config.default_image);
         let pod_name = format!("cf-job-{}", ctx.job_id);
 
-        // Resource-based：用 SandboxResources 設定 Pod resource limits
+        // Resource-based：用 SandboxResources 設定 Pod resource requests & limits
         let cpu_limit = format!("{}m", (ctx.resource_limits.cpus * 1000.0) as u64);
         let mem_limit = format!("{}Mi", ctx.resource_limits.memory / 1024 / 1024);
+        let disk_limit = format!("{}Mi", ctx.resource_limits.disk / 1024 / 1024);
+
+        // requests = limits × ratio（ratio=1.0 → Guaranteed QoS）
+        let ratio = self.config.request_ratio;
+        let cpu_req = format!("{}m", (ctx.resource_limits.cpus * 1000.0 * ratio) as u64);
+        let mem_req = format!("{}Mi", (ctx.resource_limits.memory as f64 * ratio as f64) as u64 / 1024 / 1024);
 
         let pod: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
@@ -7116,12 +7122,14 @@ impl Sandbox for K8sPodSandbox {
                     "command": [ctx.command.clone()], "args": ctx.args.clone(),
                     "env": ctx.env.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v})).collect::<Vec<_>>(),
                     "resources": {
-                        "requests": { "cpu": self.config.cpu_request, "memory": self.config.memory_request },
-                        "limits": { "cpu": cpu_limit, "memory": mem_limit },
+                        "requests": { "cpu": cpu_req, "memory": mem_req, "ephemeral-storage": disk_limit },
+                        "limits":   { "cpu": cpu_limit, "memory": mem_limit, "ephemeral-storage": disk_limit },
                     },
                     "volumeMounts": [{ "name": "job-data", "mountPath": "/tmp/job" }]
                 }],
-                "volumes": [{ "name": "job-data", "configMap": { "name": format!("cf-job-{}", ctx.job_id) } }],
+                // emptyDir：ephemeral 可寫 volume，sizeLimit 對應 job 宣告的 disk
+                // （原本用 ConfigMap，但 ConfigMap 唯讀且上限 1MB，不適合當工作目錄）
+                "volumes": [{ "name": "job-data", "emptyDir": { "sizeLimit": disk_limit } }],
                 "activeDeadlineSeconds": ctx.timeout_secs as i64,
             }
         }))?;
@@ -7202,13 +7210,17 @@ pub struct NsjailConfig {
 pub struct K8sPodConfig {
     pub namespace: String,        // "coveflow-jobs"
     pub default_image: String,
-    pub cpu_request: String,      // "100m"
-    pub memory_request: String,   // "128Mi"
+    pub request_ratio: f32,       // requests = limits × ratio，預設 1.0（Guaranteed QoS）
     pub service_account: Option<String>,
     pub node_selector: Option<std::collections::HashMap<String, String>>,
     pub image_pull_secrets: Vec<String>,
     pub auto_cleanup: bool,
 }
+// request_ratio 說明：
+//   1.0 → requests = limits（Guaranteed QoS，生產預設）
+//   0.5 → requests = limits × 0.5（Burstable QoS，允許超售）
+//   原本的靜態 cpu_request / memory_request 已移除，
+//   因為每個 job 資源需求不同，靜態值會導致 scheduler 錯誤排程
 
 // NsjailConfig 不再需要 memory_limit / cpu_time_limit / tmpfs_size，
 // 這些由 Resource-based 模型的 SandboxResources 動態提供：
