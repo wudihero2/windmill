@@ -26,7 +26,7 @@
 | JS 求值 | QuickJS + Deno（C 依賴） | `boa_engine`（純 Rust） |
 | 可觀測性 | 後加 OTel | Day 1 OpenTelemetry |
 | 沙箱 | nsjail only（Linux only） | **三模式可插拔**：nsjail / K8s Pod / Firecracker（Sandbox trait） |
-| Worker 資源模型 | 1 worker = 1 job | **Slot 模型**：1 worker = N slots，job 按需佔用 |
+| Worker 資源模型 | 1 worker = 1 job | **Resource-based**：job 宣告 cpus/memory_mb/disk_mb，Worker 追蹤三維可用資源 |
 | Script Hash | `i64`（不易讀） | SHA256 hex（可讀） |
 | Crate 數量 | 50+（複雜） | 6 核心（簡潔） |
 | Job 表設計 | 單表（queue + 結果混合） | 三表分離 + `LISTEN/NOTIFY` |
@@ -47,7 +47,7 @@
 | 部署審核 | 無（直接覆蓋） | **Deploy Approval Gate**：路徑級審核政策 + 多人審批 + diff 預覽 |
 | 集群資源可視化 | vCPU + 記憶體（無磁碟、無 CPU 使用率） | **完整 Dashboard**：CPU 使用率 + 記憶體 + 磁碟 + 佔用率 |
 | 檔案上傳 | S3 上傳 + SDK 存取（EE 功能） | **File Storage**：S3 / 本地雙模式 + 拖拉上傳 + 檔案瀏覽器 |
-| 多團隊 RBAC | Group + Folder + extra_perms | **Group + Folder + ACL + Quota**：團隊資源配額 + 路徑級讀寫控制 |
+| 多團隊 RBAC | Group + Folder + extra_perms | **Group + Folder + ACL + Quota**：團隊配額（併發+CPU/RAM+儲存）+ 路徑級讀寫控制 |
 
 ---
 
@@ -154,7 +154,7 @@ coveflow/
 │   │       │   ├── ClusterDashboard.svelte # Worker 資源監控儀表板
 │   │       │   ├── GroupManager.svelte  # 團隊 CRUD + 成員管理
 │   │       │   ├── FolderAcl.svelte    # Folder ACL 編輯器（權限矩陣）
-│   │       │   └── QuotaPanel.svelte   # 團隊配額設定 + 用量儀表板
+│   │       │   └── QuotaPanel.svelte   # 團隊配額設定 + 用量儀表板（併發/CPU/RAM/每日/儲存）
 │   │       ├── gen/                      # OpenAPI 生成
 │   │       └── stores/
 │   └── package.json
@@ -229,7 +229,7 @@ Windmill v1 把 queue 和結果放同一張表，後來 v2 才分離。我們直
 
 **問題**：Worker 數量 = 同時跑的 job 數。如果部署太多 Worker 或大量同步請求湧入，可能壓垮 DB / runtime / 外部 API。
 
-**六層防禦**（含 Slot 模型）：
+**六層防禦**（含 Resource-based 模型）：
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -247,21 +247,26 @@ Windmill v1 把 queue 和結果放同一張表，後來 v2 才分離。我們直
 │ L4: Worker 反壓（LISTEN/NOTIFY + poll 間隔）                     │
 │     Worker 有容量才拉取                                          │
 ├────────────────────────────────────────────────────────────────┤
-│ L5: 團隊配額（group_quota.max_concurrent_jobs）                  │
-│     每個團隊的併發 job 上限                                       │
+│ L5: 團隊配額（group_quota）                                      │
+│     L5a: max_concurrent_jobs：每個團隊的併發 job 數上限            │
+│     L5b: max_cpus：每個團隊可佔用的 CPU 總量上限                   │
+│     L5c: max_memory_mb：每個團隊可佔用的 RAM 總量上限              │
+│     → push_job() 檢查併發數+CPU/RAM，pull_job() 檢查 CPU/RAM 用量 │
 ├────────────────────────────────────────────────────────────────┤
-│ L6: Worker Slot 可用性                                          │
-│     pull_job WHERE slots_required <= available_slots              │
+│ L6: Worker 資源可用性                                            │
+│     L6a: j.cpus <= available_cpus                                │
+│     L6b: j.memory_mb <= available_memory_mb                      │
+│     L6c: j.disk_mb <= available_disk_mb                          │
 │     確保 job 物理上能塞進該 Worker                                │
 │                                                                  │
-│     Normal：       每 job acquire(N)，完成即歸還                   │
-│     Dedicated：    啟動時 acquire(1)，持有到關閉                    │
-│     Runner Group： 啟動時 acquire(max_conc)，持有到閒置回收         │
+│     Normal：       每 job try_acquire(cpu,mem,disk)，完成即歸還    │
+│     Dedicated：    啟動時 reserve(cpu,mem,disk)，持有到關閉         │
+│     Runner Group： 啟動時 reserve(cpu,mem,disk)，持有到閒置回收     │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-**Windmill 的做法**：只有 Layer 1（每 worker 跑一個 job，部署幾個 worker = 幾個 slot）+ 部分 Layer 4（`QUEUE_LIMIT_WAIT_RESULT`）。
-我們增加 L2（全域上限）、L3（tag 級限制）、L5（團隊配額）、L6（Slot 物理約束），更精細的控制。
+**Windmill 的做法**：只有 Layer 1（每 worker 跑一個 job，部署幾個 worker = 幾個併發）+ 部分 Layer 4（`QUEUE_LIMIT_WAIT_RESULT`）。
+我們增加 L2（全域上限）、L3（tag 級限制）、L5（團隊配額：併發數 + CPU/RAM 雙重限制）、L6（Worker 三維資源約束），更精細的控制。
 
 ### Sandbox 三模式策略（可插拔 Trait）
 
@@ -294,41 +299,41 @@ macOS 開發環境              → None（不隔離）
 
 三種模式的詳細實作程式碼見[附錄 A](#附錄-a-sandbox-三模式詳細實作)。
 
-### Slot 資源模型
+### Resource-based 資源模型
 
 **問題**：傳統的「1 worker = 1 job」模型（Windmill 的做法）在小任務上浪費大量資源。一台 8 vCPU 的機器跑一個只需 2 vCPU 的 job，75% 的算力閒置。
 
-**解法**：**Slot 模型** — 把 Worker 切成 N 個 slot，每個 slot 是最小資源分配單位。
+**解法**：**Resource-based 模型** — Job 直接宣告需要的 `cpus` + `memory_mb` + `disk_mb`，Worker 追蹤三維可用資源。
 
 ```
-Worker（8 vCPU, 32GB RAM）
-  total_slots: 4
-  per_slot: 2 vCPU, 8GB RAM, 10GB disk
+Worker（8 vCPU, 32GB RAM, 100GB Disk）
+  total_cpus: 8.0, total_memory_mb: 32768, total_disk_mb: 102400
 
-  ┌──────────────────────────────────────────────────┐
-  │ Slot 0       Slot 1       Slot 2       Slot 3    │
-  │ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ │
-  │ │ 2 vCPU  │ │ 2 vCPU  │ │ 2 vCPU  │ │ (free)  │ │
-  │ │ 8GB RAM │ │ 8GB RAM │ │ 8GB RAM │ │         │ │
-  │ │ Job A   │ │ Job B   │ │ Job C   │ │ avail.  │ │
-  │ │ Normal  │ │ Normal  │ │ Dedicat.│ │         │ │
-  │ └─────────┘ └─────────┘ └─────────┘ └─────────┘ │
-  └──────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │ CPU  [████░░░░░░] 4.0 / 8.0 cores                       │
+  │ RAM  [██████░░░░] 12.0 / 32.0 GB                        │
+  │ Disk [██░░░░░░░░]  8.0 / 100.0 GB                       │
+  │                                                          │
+  │ ├─ [Dedicated] predict_api   2.0 cpu  4.0 GB  2.0 GB    │
+  │ ├─ [Normal]    job-abc       1.0 cpu  4.0 GB  2.0 GB    │
+  │ ├─ [Normal]    job-def       1.0 cpu  4.0 GB  4.0 GB    │
+  │ └─ (free: 4.0 cpu, 20.0 GB RAM, 92.0 GB disk)           │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Slot × 執行模式 — 正交設計**：Slot 管「資源分配」，執行模式管「程序生命週期」。
+**Resource × 執行模式 — 正交設計**：ResourceManager 管「資源分配」，執行模式管「程序生命週期」。
 
 ```
-模式             佔用 Slot 數      每 job 有 sandbox？  冷啟動
-──────────────── ───────────────── ─────────────────── ──────────
-Normal           N（可設定）         有（獨立隔離）       ~65ms
-Dedicated 1:1    1（預留）           無（同一程序）       ~5ms
-Runner Group     max_conc（預留）    無（同一程序）       ~5ms
+模式             資源佔用               每 job 有 sandbox？  冷啟動
+──────────────── ───────────────────── ─────────────────── ──────────
+Normal           try_acquire(cpu,mem,disk)  有（獨立隔離）   ~65ms
+Dedicated 1:1    reserve(cpu,mem,disk)      無（同一程序）   ~5ms
+Runner Group     reserve(cpu,mem,disk)      無（同一程序）   ~5ms
 ```
 
-**漸進式導入**：Phase 1-3 設 `slots=1`（與「1 worker = 1 job」等價），但 SlotManager 已存在於程式碼中。Phase 3+ 啟用多 slot。Phase 4 加入 Dedicated/Runner Group。
+**漸進式導入**：Phase 1-3 設 `default_job_cpus=1, default_job_memory_mb=512`（一次一個小 job），但 ResourceManager 已存在於程式碼中。Phase 3+ 啟用多 job 並行。Phase 4 加入 Dedicated/Runner Group。
 
-詳細的 SlotManager 實作、pull_job 整合、6 層併發控制見下方各 Phase 的實作節。
+詳細的 ResourceManager 實作、pull_job 整合、6 層併發控制見下方各 Phase 的實作節。
 
 ### Script SHA256 版本控制
 
@@ -653,7 +658,7 @@ Worker 執行前自動處理：
 | Airflow | ❌ 靠外部 LDAP | ❌ DAG-level role | ❌ 無 |
 | Prefect | ❌ workspace 級 | ❌ 無路徑 ACL | ❌ 無 |
 | Kestra | ✅ Namespace 級（EE） | ❌ 粗粒度 | ❌ 無 |
-| **CoveFlow** | **✅ Group + Folder** | **✅ extra_perms（讀/寫/owner）** | **✅ 團隊級配額** |
+| **CoveFlow** | **✅ Group + Folder** | **✅ extra_perms（讀/寫/owner）** | **✅ 團隊級配額（併發+CPU/RAM+儲存）** |
 
 **核心設計（學 Windmill，加入團隊配額）**：
 
@@ -674,8 +679,8 @@ Workspace（公司/組織）
     │   └── f/production/       owners: [u/admin]   ← 需 Deploy Approval
     │
     └── Group Quota（資源配額）
-        ├── ml-team:    max_concurrent=10, max_storage=50GB
-        └── data-eng:   max_concurrent=20, max_storage=100GB
+        ├── ml-team:    max_concurrent=10, max_cpus=16, max_memory_mb=32768, max_storage=50GB
+        └── data-eng:   max_concurrent=20, max_cpus=32, max_memory_mb=65536, max_storage=100GB
 ```
 
 **路徑規範**：
@@ -716,13 +721,26 @@ f/shared/utils          → 共用路徑，所有人可讀
 │ Layer 1-4（現有）：Worker 數量 / 全域上限 / Tag 級 / 反壓  │
 ├────────────────────────────────────────────────────────┤
 │ Layer 5：團隊配額（group_quota 表）NEW                    │
-│   ml-team: max_concurrent_jobs = 10                    │
-│   → push_job() 檢查該團隊正在跑的 job 數                  │
-│   → 超過 → 排隊等待（不 reject，只延後）                   │
 │                                                        │
-│   ml-team: max_storage_bytes = 50GB                    │
-│   → upload_file() 檢查該團隊目前儲存用量                   │
-│   → 超過 → 403 "quota exceeded"                        │
+│   a) 併發限制（push_job 檢查）                            │
+│      ml-team: max_concurrent_jobs = 10                 │
+│      → 正在跑的 job 數 >= 10 → reject                    │
+│                                                        │
+│   b) CPU 限制（push_job + pull_job 檢查）NEW              │
+│      ml-team: max_cpus = 16                            │
+│      → 正在跑的 SUM(j.cpus) + 新 job.cpus > 16          │
+│      → 延後（等其他 job 完成釋放 CPU）                     │
+│                                                        │
+│   c) RAM 限制（push_job + pull_job 檢查）NEW              │
+│      ml-team: max_memory_mb = 32768                    │
+│      → 正在跑的 SUM(j.memory_mb) + 新 job > 32768       │
+│      → 延後（等其他 job 完成釋放 RAM）                     │
+│                                                        │
+│   d) 儲存限制（upload_file 檢查）                          │
+│      ml-team: max_storage_bytes = 50GB                 │
+│      → 超過 → 403 "quota exceeded"                      │
+│      （注意：disk 不做團隊配額——磁碟是 Worker 本地暫存，    │
+│       job 完成即清理。團隊儲存配額走 max_storage_bytes。） │
 ├────────────────────────────────────────────────────────┤
 │ 如何判斷 job 屬於哪個團隊？                                │
 │   → 看 job.script_path / flow_path 的路徑前綴              │
@@ -736,11 +754,12 @@ f/shared/utils          → 共用路徑，所有人可讀
 
 | 現有段落 | 需要修改 |
 |---------|---------|
-| Phase 1 Schema | 新增 `group_`、`usr_to_group`、`folder`、`group_quota` 表 |
+| Phase 1 Schema | 新增 `group_`、`usr_to_group`、`folder`、`group_quota`（含 `max_cpus, max_memory_mb`）表 |
 | Phase 1 Auth | `AuthedUser` 增加 groups + folders 欄位 |
 | Phase 1 Router | 新增 Group / Folder / Quota API 路由 |
 | Phase 1 Script CRUD | 加 `require_writer(path)` 檢查 |
-| Phase 1 Job push | 加團隊歸屬 + 配額檢查 |
+| Phase 1 Job push | 加團隊歸屬 + 配額檢查（併發 + CPU/RAM 雙重） |
+| Phase 1 Job pull | L5 子查詢加 `max_cpus` + `max_memory_mb` 用量檢查 |
 | Phase 3 Resource | Resource/Variable 納入 Folder ACL |
 | Phase 3 File Storage | 加團隊儲存配額 |
 | Phase 3 Cluster Dashboard | 加團隊資源用量視角 |
@@ -821,6 +840,14 @@ CREATE TABLE group_quota (
     group_ VARCHAR(100) NOT NULL,
     -- 並發 job 數上限（NULL = 不限）
     max_concurrent_jobs INTEGER,
+    -- 團隊可佔用的 CPU 總量上限（NULL = 不限）
+    -- 例：max_cpus = 16 → 團隊所有 running jobs 的 SUM(cpus) <= 16
+    max_cpus REAL,
+    -- 團隊可佔用的 RAM 總量上限 MB（NULL = 不限）
+    -- 例：max_memory_mb = 32768 → 團隊所有 running jobs 的 SUM(memory_mb) <= 32768
+    -- （注意：disk 不做團隊配額——磁碟是 Worker 本地暫存，job 完成即清理，
+    --  不像 CPU/RAM 是跨 Worker 共享池的稀缺資源。團隊儲存配額走 max_storage_bytes。）
+    max_memory_mb BIGINT,
     -- 每日 job 數上限（NULL = 不限）
     max_daily_jobs INTEGER,
     -- 檔案儲存配額 bytes（NULL = 不限）
@@ -868,8 +895,10 @@ CREATE TABLE job (
     root_job UUID,                     -- flow 的 root job
     flow_step_id VARCHAR(50),          -- 在 flow 中的步驟 ID
     flow_revision INTEGER,              -- 執行時的 flow 版本（可追溯）
-    -- Slot 資源需求
-    slots_required SMALLINT NOT NULL DEFAULT 1,  -- 此 job 需要幾個 slot（預設 1）
+    -- Resource-based 資源需求
+    cpus REAL NOT NULL DEFAULT 1,                -- 此 job 需要多少 vCPU
+    memory_mb INTEGER NOT NULL DEFAULT 512,      -- 此 job 需要多少 MB RAM
+    disk_mb INTEGER NOT NULL DEFAULT 1024,       -- 此 job 需要多少 MB 磁碟空間
     -- 團隊歸屬（從 script/flow path 自動推導）
     folder_owner VARCHAR(100),           -- NULL（個人 u/...）或 folder 名（f/ml-team/...）
     created_by VARCHAR(255) NOT NULL,
@@ -1077,11 +1106,13 @@ CREATE TABLE worker_ping (
     sandbox_mode VARCHAR(20),       -- "nsjail", "k8s", "none"
     current_job_id UUID,            -- 正在跑的 job（NULL = 閒置）
     jobs_completed INTEGER DEFAULT 0, -- 累計完成數（監控用）
-    -- Slot 資源模型
-    total_slots SMALLINT,           -- 此 Worker 的 slot 總數
-    used_slots SMALLINT,            -- 目前已佔用的 slot 數
-    slot_cpus REAL,                 -- 每 slot 的 vCPU 數
-    slot_memory BIGINT,             -- 每 slot 的 bytes
+    -- Resource-based 資源模型
+    total_cpus REAL,                -- 此 Worker 的 CPU 總量
+    used_cpus REAL,                 -- 目前已佔用的 CPU 量
+    total_memory_mb BIGINT,         -- 此 Worker 的 RAM 總量 (MB)
+    used_memory_mb BIGINT,          -- 目前已佔用的 RAM (MB)
+    total_disk_mb BIGINT,           -- 此 Worker 的 Disk 總量 (MB)
+    used_disk_mb BIGINT,            -- 目前已佔用的 Disk (MB)
     -- 資源配額（靜態，啟動時偵測）
     vcpus INTEGER,                  -- vCPU 數（cgroup quota / sysinfo）
     memory_total BIGINT,            -- 總記憶體 bytes（cgroup limit / meminfo）
@@ -1144,7 +1175,7 @@ pub trait Sandbox: Send + Sync {
     async fn health_check(&self) -> Result<(), SandboxError>;
     /// 沙箱名稱（用於日誌和監控）
     fn name(&self) -> &str;
-    /// 資源限制能力（供 SlotManager 查詢）
+    /// 資源限制能力（供 ResourceManager 查詢）
     fn supports_resource_limits(&self) -> bool { true }
 }
 
@@ -1159,15 +1190,15 @@ pub struct SandboxContext {
     pub language: ScriptLang,
     pub custom_image: Option<String>,
     pub trace_context: Option<TraceContext>,
-    // Slot 模型：沙箱的資源限制由 slot 大小 × slots_required 決定
+    // Resource-based：沙箱的資源限制直接來自 job 宣告的 cpus/memory_mb/disk_mb
     pub resource_limits: SandboxResources,
 }
 
-/// Slot 模型提供的資源限制
+/// Resource-based 模型提供的資源限制
 pub struct SandboxResources {
-    pub cpus: f32,         // slot.cpus × slots_required
-    pub memory: u64,       // slot.memory × slots_required (bytes)
-    pub disk: u64,         // slot.disk × slots_required (bytes)
+    pub cpus: f32,         // 直接來自 job.cpus
+    pub memory: u64,       // job.memory_mb × 1024 × 1024 (bytes)
+    pub disk: u64,         // job.disk_mb × 1024 × 1024 (bytes)
     pub timeout: u32,      // 最大執行秒數
 }
 
@@ -1307,13 +1338,13 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
     if let Some(folder_owner) = args.folder_owner {
         // 查對應團隊的 group_quota
         let quota = sqlx::query!(
-            "SELECT max_concurrent_jobs, max_daily_jobs FROM group_quota
+            "SELECT max_concurrent_jobs, max_cpus, max_memory_mb, max_daily_jobs FROM group_quota
              WHERE workspace_id = $1 AND group_ = $2",
             args.workspace_id, folder_owner
         ).fetch_optional(&mut *tx).await?;
 
         if let Some(q) = quota {
-            // 檢查並發上限
+            // 檢查並發上限（job 數量）
             if let Some(max_conc) = q.max_concurrent_jobs {
                 let running: i64 = sqlx::query_scalar!(
                     "SELECT COUNT(*) FROM job_queue jq
@@ -1327,6 +1358,44 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
                     return Err(anyhow::anyhow!(
                         "group '{}' concurrent job limit reached ({}/{})",
                         folder_owner, running, max_conc
+                    ));
+                }
+            }
+            // 檢查 CPU 上限（佔用 CPU 總量）
+            // 注意：這裡只做「即時拒絕」，防止團隊無限推入大 job
+            // pull_job 的 L5 子查詢才是真正的排程卡控
+            if let Some(max_c) = q.max_cpus {
+                let used_cpus: f64 = sqlx::query_scalar!(
+                    "SELECT COALESCE(SUM(j.cpus::DOUBLE PRECISION), 0) FROM job_queue jq
+                     JOIN job j ON j.id = jq.id
+                     WHERE j.workspace_id = $1
+                       AND j.folder_owner = $2
+                       AND jq.running = TRUE",
+                    args.workspace_id, folder_owner
+                ).fetch_one(&mut *tx).await?.unwrap_or(0.0);
+                let needed = args.cpus.unwrap_or(1.0) as f64;
+                if used_cpus + needed > max_c as f64 {
+                    return Err(anyhow::anyhow!(
+                        "group '{}' CPU quota exceeded ({:.1}/{:.1} cpus, job needs {:.1})",
+                        folder_owner, used_cpus, max_c, needed
+                    ));
+                }
+            }
+            // 檢查 RAM 上限（佔用 memory_mb 總量）
+            if let Some(max_m) = q.max_memory_mb {
+                let used_mem: i64 = sqlx::query_scalar!(
+                    "SELECT COALESCE(SUM(j.memory_mb), 0) FROM job_queue jq
+                     JOIN job j ON j.id = jq.id
+                     WHERE j.workspace_id = $1
+                       AND j.folder_owner = $2
+                       AND jq.running = TRUE",
+                    args.workspace_id, folder_owner
+                ).fetch_one(&mut *tx).await?.unwrap_or(0);
+                let needed = args.memory_mb.unwrap_or(512) as i64;
+                if used_mem + needed > max_m {
+                    return Err(anyhow::anyhow!(
+                        "group '{}' memory quota exceeded ({}/{} MB, job needs {} MB)",
+                        folder_owner, used_mem, max_m, needed
                     ));
                 }
             }
@@ -1391,10 +1460,11 @@ pub async fn push_job(db: &PgPool, args: PushJobArgs<'_>) -> Result<Uuid> {
 
 // crates/queue/src/pull.rs
 
-/// FOR UPDATE SKIP LOCKED — 搶 job（含全域並發控制 + L6 Slot 可用性）
-/// available_slots: 此 Worker 目前可用的 slot 數（由 SlotManager 提供）
+/// FOR UPDATE SKIP LOCKED — 搶 job（含全域並發控制 + L6 資源可用性）
+/// available_cpus/mem/disk: 此 Worker 目前可用的資源（由 ResourceManager 提供）
 pub async fn pull_job(
-    db: &PgPool, worker_name: &str, tags: &[String], available_slots: u32,
+    db: &PgPool, worker_name: &str, tags: &[String],
+    available_cpus: f32, available_memory_mb: i64, available_disk_mb: i64,
 ) -> Result<Option<PulledJob>> {
     // 1. L2: 檢查全域並發上限
     let global_limit = sqlx::query_scalar!(
@@ -1411,18 +1481,22 @@ pub async fn pull_job(
         }
     }
 
-    // 2. L3 + L5 + L6: tag 級 + 團隊級 + Slot 可用性
+    // 2. L3 + L5 + L6: tag 級 + 團隊級 + 資源可用性
     let row = sqlx::query_as!(PulledJob,
         r#"
         WITH next_job AS (
-            SELECT jq.id, jq.tag, j.slots_required
+            SELECT jq.id, jq.tag, j.cpus, j.memory_mb, j.disk_mb
             FROM job_queue jq
             JOIN job j ON j.id = jq.id
             WHERE jq.running = FALSE
               AND jq.scheduled_for <= now()
               AND jq.tag = ANY($1)
-              -- L6: Slot 可用性（必須能塞進 Worker 的可用 slot）
-              AND j.slots_required <= $3
+              -- L6a: CPU 可用性
+              AND j.cpus <= $3
+              -- L6b: RAM 可用性
+              AND j.memory_mb <= $4
+              -- L6c: Disk 可用性
+              AND j.disk_mb <= $5
               -- L3: tag 級並發控制
               AND NOT EXISTS (
                   SELECT 1 FROM concurrency_limit cl
@@ -1430,9 +1504,9 @@ pub async fn pull_job(
                     AND (SELECT COUNT(*) FROM job_queue jq2
                          WHERE jq2.tag = jq.tag AND jq2.running = TRUE) >= cl.max_concurrent
               )
-              -- L5: 團隊級並發控制（group_quota）
+              -- L5a: 團隊級並發控制（group_quota.max_concurrent_jobs）
               AND (
-                  j.folder_owner IS NULL  -- 個人 job 不受團隊配額限制
+                  j.folder_owner IS NULL
                   OR NOT EXISTS (
                       SELECT 1 FROM group_quota gq
                       WHERE gq.workspace_id = j.workspace_id
@@ -1445,6 +1519,42 @@ pub async fn pull_job(
                                AND jq3.running = TRUE) >= gq.max_concurrent_jobs
                   )
               )
+              -- L5b: 團隊級 CPU 控制（group_quota.max_cpus）
+              AND (
+                  j.folder_owner IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM group_quota gq
+                      WHERE gq.workspace_id = j.workspace_id
+                        AND gq.group_ = j.folder_owner
+                        AND gq.max_cpus IS NOT NULL
+                        AND (
+                            SELECT COALESCE(SUM(j4.cpus::DOUBLE PRECISION), 0)
+                            FROM job_queue jq4
+                            JOIN job j4 ON j4.id = jq4.id
+                            WHERE j4.workspace_id = j.workspace_id
+                              AND j4.folder_owner = j.folder_owner
+                              AND jq4.running = TRUE
+                        ) + j.cpus::DOUBLE PRECISION > gq.max_cpus::DOUBLE PRECISION
+                  )
+              )
+              -- L5c: 團隊級 RAM 控制（group_quota.max_memory_mb）
+              AND (
+                  j.folder_owner IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM group_quota gq
+                      WHERE gq.workspace_id = j.workspace_id
+                        AND gq.group_ = j.folder_owner
+                        AND gq.max_memory_mb IS NOT NULL
+                        AND (
+                            SELECT COALESCE(SUM(j5.memory_mb), 0)
+                            FROM job_queue jq5
+                            JOIN job j5 ON j5.id = jq5.id
+                            WHERE j5.workspace_id = j.workspace_id
+                              AND j5.folder_owner = j.folder_owner
+                              AND jq5.running = TRUE
+                        ) + j.memory_mb > gq.max_memory_mb
+                  )
+              )
             ORDER BY jq.priority DESC, jq.scheduled_for ASC
             LIMIT 1
             FOR UPDATE OF jq SKIP LOCKED
@@ -1453,9 +1563,11 @@ pub async fn pull_job(
         SET running = TRUE, started_at = now(), worker = $2, last_ping = now()
         FROM next_job
         WHERE job_queue.id = next_job.id
-        RETURNING job_queue.id, job_queue.tag, next_job.slots_required
+        RETURNING job_queue.id, job_queue.tag,
+                  next_job.cpus, next_job.memory_mb, next_job.disk_mb
         "#,
-        tags, worker_name, available_slots as i32
+        tags, worker_name,
+        available_cpus, available_memory_mb, available_disk_mb
     )
     .fetch_optional(db)
     .await?;
@@ -1511,82 +1623,136 @@ pub async fn complete_job(
 }
 ```
 
-### 1.4 SlotManager 實作
+### 1.4 ResourceManager 實作
 
 ```rust
-// crates/worker/src/slot_manager.rs
+// crates/worker/src/resource_manager.rs
 
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use std::sync::Mutex as StdMutex;  // 非 async——鎖持有時間極短，避免 async mutex 開銷
 
-pub struct SlotManager {
-    semaphore: Arc<Semaphore>,
-    total: u32,
+/// Worker 的三維資源池
+pub struct ResourceManager {
+    total_cpus: f32,
+    total_memory_mb: u64,
+    total_disk_mb: u64,
+    inner: StdMutex<ResourceState>,
+    notify: tokio::sync::Notify,
 }
 
-/// RAII guard — drop 時自動歸還 slot
-pub struct SlotGuard {
-    _permits: Vec<OwnedSemaphorePermit>,
-    count: u32,
+struct ResourceState {
+    used_cpus: f32,
+    used_memory_mb: u64,
+    used_disk_mb: u64,
+    // Dedicated/Runner Group 永久預留的資源
+    reserved_cpus: f32,
+    reserved_memory_mb: u64,
+    reserved_disk_mb: u64,
 }
 
-impl SlotManager {
-    pub fn new(total_slots: u32) -> Self {
+/// RAII guard — drop 時自動歸還資源（Normal job 用）
+pub struct ResourceGuard {
+    cpus: f32,
+    memory_mb: u64,
+    disk_mb: u64,
+    manager: Arc<ResourceManager>,
+}
+
+/// 永久預留 — 不會自動歸還（Dedicated/Runner Group 用）
+pub struct ResourceReservation {
+    cpus: f32,
+    memory_mb: u64,
+    disk_mb: u64,
+    manager: Arc<ResourceManager>,
+}
+
+impl ResourceManager {
+    pub fn new(total_cpus: f32, total_memory_mb: u64, total_disk_mb: u64) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(total_slots as usize)),
-            total: total_slots,
+            total_cpus,
+            total_memory_mb,
+            total_disk_mb,
+            inner: StdMutex::new(ResourceState {
+                used_cpus: 0.0, used_memory_mb: 0, used_disk_mb: 0,
+                reserved_cpus: 0.0, reserved_memory_mb: 0, reserved_disk_mb: 0,
+            }),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
-    /// 取得 N 個 slot（阻塞直到可用）
-    pub async fn acquire(&self, n: u32) -> SlotGuard {
-        let mut permits = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            permits.push(self.semaphore.clone().acquire_owned().await.unwrap());
+    /// 可供 Normal job 使用的資源 = total - reserved - used
+    pub fn available(&self) -> (f32, u64, u64) {
+        let s = self.inner.lock().unwrap();
+        (
+            self.total_cpus - s.reserved_cpus - s.used_cpus,
+            self.total_memory_mb - s.reserved_memory_mb - s.used_memory_mb,
+            self.total_disk_mb - s.reserved_disk_mb - s.used_disk_mb,
+        )
+    }
+
+    /// 嘗試取得資源（非阻塞）— Normal job pull 後立即呼叫
+    pub fn try_acquire(&self, cpus: f32, mem_mb: u64, disk_mb: u64) -> Option<ResourceGuard> {
+        let mut s = self.inner.lock().unwrap();
+        let free_cpu = self.total_cpus - s.reserved_cpus - s.used_cpus;
+        let free_mem = self.total_memory_mb - s.reserved_memory_mb - s.used_memory_mb;
+        let free_disk = self.total_disk_mb - s.reserved_disk_mb - s.used_disk_mb;
+        if cpus <= free_cpu && mem_mb <= free_mem && disk_mb <= free_disk {
+            s.used_cpus += cpus;
+            s.used_memory_mb += mem_mb;
+            s.used_disk_mb += disk_mb;
+            Some(ResourceGuard { cpus, memory_mb: mem_mb, disk_mb, manager: self.into() })
+        } else {
+            None
         }
-        SlotGuard { _permits: permits, count: n }
     }
 
-    /// 嘗試取得 N 個 slot（非阻塞）
-    pub fn try_acquire(&self, n: u32) -> Option<SlotGuard> {
-        let mut permits = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            match self.semaphore.clone().try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => return None, // slot 不足
-            }
+    /// 永久預留資源（Dedicated / Runner Group 啟動時呼叫）
+    pub fn reserve(&self, cpus: f32, mem_mb: u64, disk_mb: u64) -> Option<ResourceReservation> {
+        let mut s = self.inner.lock().unwrap();
+        let free_cpu = self.total_cpus - s.reserved_cpus - s.used_cpus;
+        let free_mem = self.total_memory_mb - s.reserved_memory_mb - s.used_memory_mb;
+        let free_disk = self.total_disk_mb - s.reserved_disk_mb - s.used_disk_mb;
+        if cpus <= free_cpu && mem_mb <= free_mem && disk_mb <= free_disk {
+            s.reserved_cpus += cpus;
+            s.reserved_memory_mb += mem_mb;
+            s.reserved_disk_mb += disk_mb;
+            Some(ResourceReservation { cpus, memory_mb: mem_mb, disk_mb, manager: self.into() })
+        } else {
+            None
         }
-        Some(SlotGuard { _permits: permits, count: n })
-    }
-
-    pub fn available(&self) -> u32 {
-        self.semaphore.available_permits() as u32
-    }
-
-    pub fn total(&self) -> u32 {
-        self.total
     }
 
     pub async fn wait_for_release(&self) {
-        // 等到至少 1 個 slot 被歸還
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-        drop(permit); // 立即歸還，只是為了等待
+        self.notify.notified().await;
     }
 }
 
-impl SlotGuard {
-    /// 阻止自動歸還（用於 Dedicated/RunnerGroup 永久持有 slot）
-    pub fn forget(self) {
-        for permit in self._permits {
-            permit.forget(); // Semaphore permit 不會被歸還
-        }
-        std::mem::forget(self);
+impl Drop for ResourceGuard {
+    fn drop(&mut self) {
+        let mut s = self.manager.inner.lock().unwrap();
+        s.used_cpus -= self.cpus;
+        s.used_memory_mb -= self.memory_mb;
+        s.used_disk_mb -= self.disk_mb;
+        self.manager.notify.notify_waiters();
     }
 }
-// SlotGuard drop 時自動歸還（RAII 模式）
-// Normal job 完成 -> guard drop -> slot 回到池中
+// Normal job 完成 -> guard drop -> 資源回到池中 -> notify_waiters 喚醒主迴圈
+
+impl Drop for ResourceReservation {
+    fn drop(&mut self) {
+        // Dedicated 停止時才會 drop → 歸還 reserved 資源
+        let mut s = self.manager.inner.lock().unwrap();
+        s.reserved_cpus -= self.cpus;
+        s.reserved_memory_mb -= self.memory_mb;
+        s.reserved_disk_mb -= self.disk_mb;
+        self.manager.notify.notify_waiters();
+    }
+}
 ```
 
-### 1.5 Worker 主迴圈（整合 SlotManager）
+**為什麼改用 `std::Mutex` 而非 `tokio::Mutex`？**
+鎖內只做加減法（幾個 ns），不含 await。`std::Mutex` 比 async mutex 快 10 倍，且可在 `Drop` 中使用（async Drop 不存在）。
+
+### 1.5 Worker 主迴圈（整合 ResourceManager）
 
 ```rust
 // crates/worker/src/worker.rs
@@ -1602,23 +1768,41 @@ pub async fn run_worker(
     let worker_dir = format!("/tmp/coveflow/{}", worker_name);
     tokio::fs::create_dir_all(&worker_dir).await.unwrap();
 
-    // 初始化 SlotManager（Phase 1-3: slots=1, Phase 3+: auto）
-    let slot_manager = SlotManager::new(config.slots);
+    // 啟動時資源驗證（自動偵測 + validate + clamp）
+    let mut resolved_config = config.clone();
+    resource_check::validate_and_resolve(&mut resolved_config, &worker_dir);
 
-    // 健康檢查：定期 ping（含 slot 狀態回報）
+    // 初始化 ResourceManager
+    let rm = Arc::new(ResourceManager::new(
+        resolved_config.total_cpus.unwrap(),
+        resolved_config.total_memory_mb.unwrap(),
+        resolved_config.total_disk_mb.unwrap(),
+    ));
+
+    // 健康檢查：定期 ping（含資源狀態回報）
     let db2 = db.clone();
     let wn = worker_name.clone();
-    let sm = slot_manager.clone();
+    let rm2 = rm.clone();
     tokio::spawn(async move {
         loop {
+            let (free_cpu, free_mem, free_disk) = rm2.available();
+            let total_cpus = resolved_config.total_cpus.unwrap();
+            let total_mem = resolved_config.total_memory_mb.unwrap();
+            let total_disk = resolved_config.total_disk_mb.unwrap();
             sqlx::query!(
-                "INSERT INTO worker_ping (worker, ping_at, tags, total_slots, used_slots, slot_cpus, slot_memory)
-                 VALUES ($1, now(), $2, $3, $4, $5, $6)
+                "INSERT INTO worker_ping (worker, ping_at, tags,
+                 total_cpus, used_cpus, total_memory_mb, used_memory_mb,
+                 total_disk_mb, used_disk_mb)
+                 VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (worker) DO UPDATE SET
-                   ping_at = now(), total_slots = $3, used_slots = $4",
+                   ping_at = now(),
+                   total_cpus = $3, used_cpus = $4,
+                   total_memory_mb = $5, used_memory_mb = $6,
+                   total_disk_mb = $7, used_disk_mb = $8",
                 wn, &tags_for_ping,
-                sm.total() as i16, (sm.total() - sm.available()) as i16,
-                config.slot.cpus, config.slot.memory as i64,
+                total_cpus, total_cpus - free_cpu,
+                total_mem as i64, (total_mem - free_mem) as i64,
+                total_disk as i64, (total_disk - free_disk) as i64,
             ).execute(&db2).await.ok();
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
@@ -1629,20 +1813,24 @@ pub async fn run_worker(
     listener.listen("new_job").await.unwrap();
 
     loop {
-        // L6: 檢查 slot 可用性
-        let available = slot_manager.available();
-        if available == 0 {
-            // 所有 slot 都佔用中，等任一 job 完成
-            slot_manager.wait_for_release().await;
+        // L6: 檢查資源可用性
+        let (free_cpu, free_mem, free_disk) = rm.available();
+        if free_cpu <= 0.0 || free_mem == 0 || free_disk == 0 {
+            // 所有資源都耗盡，等任一 job 完成
+            rm.wait_for_release().await;
             continue;
         }
 
-        // 拉取能塞進可用 slot 的 job
-        match queue::pull_job(&db, &worker_name, &tags, available).await {
+        // 拉取能塞進可用資源的 job
+        match queue::pull_job(
+            &db, &worker_name, &tags,
+            free_cpu, free_mem as i64, free_disk as i64,
+        ).await {
             Ok(Some(pulled)) => {
                 let job = pulled.job;
-                let slots_required = pulled.slots_required;
-                let guard = slot_manager.acquire(slots_required as u32).await;
+                let guard = rm.try_acquire(
+                    pulled.cpus, pulled.memory_mb as u64, pulled.disk_mb as u64,
+                ).expect("resources were just checked");
 
                 let job_dir = format!("{}/{}", worker_dir, job.id);
                 tokio::fs::create_dir_all(&job_dir).await.unwrap();
@@ -1654,17 +1842,19 @@ pub async fn run_worker(
                         KeyValue::new("job.id", job.id.to_string()),
                         KeyValue::new("job.workspace", job.workspace_id.clone()),
                         KeyValue::new("job.tag", pulled.tag.clone()),
-                        KeyValue::new("job.slots_required", slots_required as i64),
+                        KeyValue::new("job.cpus", pulled.cpus as f64),
+                        KeyValue::new("job.memory_mb", pulled.memory_mb as i64),
+                        KeyValue::new("job.disk_mb", pulled.disk_mb as i64),
                     ])
                     .start(&tracer);
                 let cx = opentelemetry::Context::current_with_span(span);
 
-                // 計算此 job 的 sandbox 資源限制（slot 大小 × slots_required）
+                // 直接使用 job 宣告的資源
                 let sandbox_resources = SandboxResources {
-                    cpus: config.slot.cpus * slots_required as f32,
-                    memory: config.slot.memory * slots_required as u64,
-                    disk: config.slot.disk * slots_required as u64,
-                    timeout: config.slot.timeout,
+                    cpus: pulled.cpus,
+                    memory: pulled.memory_mb as u64 * 1024 * 1024,
+                    disk: pulled.disk_mb as u64 * 1024 * 1024,
+                    timeout: config.job_timeout_secs,
                 };
 
                 let sandbox = sandbox_router.select(&pulled.tag, None);
@@ -1696,7 +1886,7 @@ pub async fn run_worker(
                         update_flow_after_job_completion(&db_clone, parent_job, job.id).await.ok();
                     }
 
-                    drop(guard); // RAII: 歸還 slot 到池中
+                    drop(guard); // RAII: 歸還資源到池中 → notify_waiters
                 });
 
                 continue; // 立即嘗試拉下一個 job
@@ -2619,7 +2809,7 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // 5. Worker（Slot 模型：1 個 Worker process，N 個 slot 併發）
+    // 5. Worker（Resource-based：1 個 Worker process，多 job 按資源並行）
     let worker_config = config.clone();
     let db_worker = db.clone();
     let sandbox_worker = sandbox.clone();
@@ -2704,91 +2894,99 @@ npm run dev  # http://localhost:5173
 9. 佇列反壓：設 queue_limit=2 → 同時發 5 個 sync 請求 → 後 3 個收到 503
 ```
 
-### 1.11 Slot 模型部署指南
+### 1.11 Resource-based 部署指南
 
-**同機部署：API Server 與 Worker 的資源預留**
+**Worker 啟動時資源驗證（自動偵測 + validate + clamp）**
 
-當 API Server 和 Worker 跑在同一台機器時（`--mode all`），Worker 啟動時自動扣除預留量：
+三種模式：
+
+| 部署方式 | CPU/RAM/Disk 設定 | 行為 |
+|---------|-----------------|------|
+| 全部省略（推薦） | `total_cpus = auto` | 自動偵測 - reserved |
+| 手動指定 | `total_cpus = 6` | 使用指定值，超過則 warn + clamp |
+| Container/K8s | 省略 | 自動讀 cgroup quota（最準確） |
 
 ```
 Worker 啟動時自動偵測可用資源：
 
-  detected_cpu = 8 vCPU          # sysinfo / cgroup
-  detected_mem = 32 GB
+  detected_cpu = 8 vCPU          # sysinfo / cgroup v2 (cpu.max)
+  detected_mem = 32768 MB        # sysinfo / cgroup v2 (memory.max)
+  detected_disk = 102400 MB      # statvfs(job_dir)
 
-  reserved_cpu = RESERVED_CPU    # 環境變數，預設 1
-  reserved_mem = RESERVED_MEM_MB # 環境變數，預設 1024 (MB)
+  reserved_cpu = 1               # config [worker.reserved] cpu
+  reserved_mem = 1024 MB         # config [worker.reserved] memory_mb
+  reserved_disk = 0              # config [worker.reserved] disk_mb
 
-  available_cpu = detected_cpu - reserved_cpu  = 7
-  available_mem = detected_mem - reserved_mem  = 31 GB
+  available_cpu = 8 - 1 = 7.0 CPUs
+  available_mem = 32768 - 1024 = 31744 MB
+  available_disk = 102400 - 0 = 102400 MB
 
-  slot.cpus = 2
-  slot.memory = 8 GB
-
-  auto_slots = min(7 / 2, 31 / 8) = min(3, 3) = 3
+  → ResourceManager::new(7.0, 31744, 102400)
+  → 同時可跑多個 job，只要 CPU+RAM+Disk 三維都不超額
 ```
 
 **各部署模式的建議值**：
 
 ```
-┌─ 部署方式 ──────────────────── RESERVED_CPU ── RESERVED_MEM ──────────┐
+┌─ 部署方式 ──────────────────── reserved.cpu ── reserved.memory_mb ────┐
 │                                                                        │
 │ 1. 單機 all-in-one                                                     │
-│    coveflow --mode all                     1 core       1 GB          │
+│    coveflow --mode all                     1             1024          │
 │                                                                        │
 │ 2. 單機分 process                                                      │
 │    coveflow --mode server  (PID 1001)                                  │
-│    coveflow --mode worker  (PID 1002)      1 core       1 GB          │
+│    coveflow --mode worker  (PID 1002)      1             1024          │
 │                                                                        │
 │ 3. Worker 獨立機器 / Container / Pod                                    │
-│    機器上只有 Worker，沒有 API Server       0            256 MB         │
+│    機器上只有 Worker，沒有 API Server       0             256           │
 │                                                                        │
 │ 4. 多 Worker 同機                                                      │
-│    每個 Worker 手動設定 slots = M                                       │
-│    確保 N * M * slot.cpus <= available_cpu  0 (手動算)   256 MB (每個)  │
+│    每個 Worker 手動設定 total_cpus / total_memory_mb                    │
+│    確保 N 個 Worker 的總和 <= 機器資源      0 (手動算)     256 (每個)    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Slot Dashboard（前端 ClusterDashboard 整合）**：
+**Resource Dashboard（前端 ClusterDashboard 整合）**：
 
 ```
-┌── Worker Dashboard ─────────────────────────────────────────────┐
-│                                                                  │
-│  Worker 1 (default, gpu)  [████░░░░] 2/4 slots                  │
-│    Slot 0: [Normal]     job-abc  python3  f/ml-team/predict 12s │
-│    Slot 1: [Normal]     job-def  python3  f/data/etl        45s │
-│    Slot 2: (free)                                                │
-│    Slot 3: (free)                                                │
-│                                                                  │
-│  Worker 2 (default)       [██████░░] 3/4 slots                  │
-│    Slot 0: [Dedicated]  predict_api  python3  persistent    4h  │
-│    Slot 1: [Normal]     job-ghi  typescript  u/alice/test   2s  │
-│    Slot 2: [Normal]     job-jkl  python3     f/sre/health   8s  │
-│    Slot 3: (free)                                                │
-│                                                                  │
-│  Worker 3 (heavy)         [████████] 4/4 slots  FULL            │
-│    Slot 0-3: [Normal]   job-mno  python3  f/ml/train  slots=4  │
-│                                                                  │
-│  Cluster: 12 total slots | 7 used | 5 free | 58% utilization    │
-└──────────────────────────────────────────────────────────────────┘
+┌── Worker Dashboard ──────────────────────────────────────────────────────┐
+│                                                                          │
+│  Worker 1 (default, gpu)                                                 │
+│    CPU  [████░░░░░░] 4.0 / 8.0 cores                                    │
+│    RAM  [██████░░░░] 12.0 / 32.0 GB                                     │
+│    Disk [██░░░░░░░░]  8.0 / 100.0 GB                                    │
+│    ├─ [Dedicated] predict_api   2.0 cpu  4.0 GB  2.0 GB  python3  4h12m │
+│    ├─ [Normal]    job-abc       1.0 cpu  4.0 GB  2.0 GB  python3  12s   │
+│    ├─ [Normal]    job-def       1.0 cpu  4.0 GB  4.0 GB  python3  45s   │
+│    └─ (free: 4.0 cpu, 20.0 GB RAM, 92.0 GB disk)                        │
+│                                                                          │
+│  Worker 2 (default)                                                      │
+│    CPU  [██░░░░░░░░] 1.0 / 4.0 cores                                    │
+│    RAM  [████░░░░░░] 2.0 / 16.0 GB                                      │
+│    Disk [█░░░░░░░░░]  1.0 / 50.0 GB                                     │
+│    ├─ [Normal]    job-ghi       1.0 cpu  2.0 GB  1.0 GB  typescript  2s │
+│    └─ (free: 3.0 cpu, 14.0 GB RAM, 49.0 GB disk)                        │
+│                                                                          │
+│  Cluster: 12.0 total cpu | 5.0 used | 42% utilization                   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **漸進式導入路徑**：
 
 ```
 Phase 1-3（保持簡單）：
-  slots = 1（預設）
-  每個 Worker 一次跑 1 個 job（與傳統模型相同）
-  但 SlotManager 已存在於程式碼中（只是設為 1）
+  default_job_cpus = 1, default_job_memory_mb = 512
+  每個 job 請求少量資源（與傳統「1 worker = 1 job」接近）
+  但 ResourceManager 已存在於程式碼中
 
-Phase 3+（啟用多 slot）：
-  slots = auto（vCPUs / slot.cpus）
-  Normal job：多 job 併發，每 job 有 per-slot sandbox
+Phase 3+（啟用多 job 並行）：
+  Worker 自動偵測 8 CPU, 32GB RAM
+  Job A: 2 cpu, 4GB → Job B: 4 cpu, 8GB → Job C: 1 cpu, 2GB → 三個同時跑
   尚無 Dedicated/Runner Group
 
 Phase 4（加入 Dedicated）：
-  Dedicated/Runner Group 啟動時預留 slot
-  剩餘 slot 供 Normal job 使用
+  Dedicated/Runner Group 啟動時 reserve(cpu, mem, disk)
+  剩餘資源供 Normal job 使用
   完整組合矩陣可用
 ```
 
@@ -5864,17 +6062,20 @@ pub async fn set_quota(
         return Err(ApiError::Forbidden("admin only".into()));
     }
     sqlx::query!(
-        "INSERT INTO group_quota (workspace_id, group_, max_concurrent_jobs, max_daily_jobs,
-         max_storage_bytes, max_job_timeout_secs)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO group_quota (workspace_id, group_, max_concurrent_jobs,
+         max_cpus, max_memory_mb,
+         max_daily_jobs, max_storage_bytes, max_job_timeout_secs)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (workspace_id, group_) DO UPDATE SET
            max_concurrent_jobs = EXCLUDED.max_concurrent_jobs,
+           max_cpus = EXCLUDED.max_cpus,
+           max_memory_mb = EXCLUDED.max_memory_mb,
            max_daily_jobs = EXCLUDED.max_daily_jobs,
            max_storage_bytes = EXCLUDED.max_storage_bytes,
            max_job_timeout_secs = EXCLUDED.max_job_timeout_secs",
         workspace_id, group_name,
-        req.max_concurrent_jobs, req.max_daily_jobs,
-        req.max_storage_bytes, req.max_job_timeout_secs,
+        req.max_concurrent_jobs, req.max_cpus, req.max_memory_mb,
+        req.max_daily_jobs, req.max_storage_bytes, req.max_job_timeout_secs,
     ).execute(&state.db).await?;
     Ok(StatusCode::OK)
 }
@@ -5902,6 +6103,22 @@ pub async fn get_quota(
         workspace_id, group_name
     ).fetch_one(&state.db).await?.unwrap_or(0);
 
+    // 查詢目前佔用的 CPU 量
+    let used_cpus: f64 = sqlx::query_scalar!(
+        "SELECT COALESCE(SUM(j.cpus::DOUBLE PRECISION), 0) FROM job_queue jq
+         JOIN job j ON j.id = jq.id
+         WHERE j.workspace_id = $1 AND j.folder_owner = $2 AND jq.running = TRUE",
+        workspace_id, group_name
+    ).fetch_one(&state.db).await?.unwrap_or(0.0);
+
+    // 查詢目前佔用的 RAM (MB)
+    let used_memory_mb: i64 = sqlx::query_scalar!(
+        "SELECT COALESCE(SUM(j.memory_mb), 0) FROM job_queue jq
+         JOIN job j ON j.id = jq.id
+         WHERE j.workspace_id = $1 AND j.folder_owner = $2 AND jq.running = TRUE",
+        workspace_id, group_name
+    ).fetch_one(&state.db).await?.unwrap_or(0);
+
     let today_jobs: i64 = sqlx::query_scalar!(
         "SELECT COUNT(*) FROM job j
          WHERE j.workspace_id = $1 AND j.folder_owner = $2
@@ -5919,6 +6136,8 @@ pub async fn get_quota(
     Ok(Json(QuotaUsage {
         quota,
         current_running_jobs: running_jobs,
+        current_used_cpus: used_cpus,
+        current_used_memory_mb: used_memory_mb,
         current_daily_jobs: today_jobs,
         current_storage_bytes: storage_bytes,
     }))
@@ -6100,7 +6319,11 @@ pub async fn group_resource_usage(
 33. Admin 無視 ACL: admin 可存取任何路徑下的 script/flow/resource
 34. 團隊並發配額: 設 ml-team max_concurrent_jobs=2 → 同時推 5 個 f/ml-team/ job → 最多 2 個同時跑
 35. 團隊每日配額: 設 ml-team max_daily_jobs=10 → 跑到第 11 個 → 確認被拒絕
-36. 配額使用量 API: GET /group_quotas/ml-team → 確認 current_running_jobs + current_daily_jobs 正確
+36. 配額使用量 API: GET /group_quotas/ml-team → 確認 current_running_jobs + current_used_cpus + current_used_memory_mb + current_daily_jobs 正確
+42. 團隊 CPU 配額: 設 ml-team max_cpus=4 → 推 cpus=2 的 job 3 個 → 最多 2 個同時跑（佔 4 cpus），第 3 個延後
+43. CPU 配額 push 拒絕: 設 ml-team max_cpus=4 → 已有 3 cpus running → 推 cpus=2 → 被 push_job reject
+44. 併發+CPU 雙重限制: 設 max_concurrent=5, max_cpus=3 → 推 5 個 1-cpu job → 最多 3 個跑（受 CPU 限制）
+45. RAM 配額: 設 ml-team max_memory_mb=8192 → 推 memory_mb=4096 的 job 3 個 → 最多 2 個同時跑（佔 8192 MB），第 3 個延後
 37. 自動建 folder: 建立 group "sre" → 確認 folder "sre" 自動建立且 g/sre 有讀寫權
 38. Resource ACL: 建 f/ml-team/prod_db resource → alice 可讀, bob（非 ml-team）不可讀
 39. File Storage 配額: 設 ml-team max_storage_bytes=100MB → 上傳 110MB → 確認被拒絕
@@ -6788,7 +7011,7 @@ flow_job (root span)
 - 更多 Trigger 類型：Kafka、MQTT、PostgreSQL CDC、S3 事件（基於 Phase 3 的 Trigger Trait 擴展）
 - App Builder（低代碼 UI）
 - Firecracker microVM 沙箱完整實作（Sandbox trait 已預留，Phase 4+ 實作 FirecrackerSandbox）
-- CPU Pinning（per-slot CPU affinity，NUMA 感知，ML inference 場景）
+- CPU Pinning（per-job CPU affinity，NUMA 感知，ML inference 場景）
 - Marketplace（分享自訂節點和 Flow 範本）
 - Software-Defined Assets（學 Dagster，將 data lineage 做為 first-class 概念）
 
@@ -6813,7 +7036,7 @@ impl Sandbox for NsjailSandbox {
             _ => return Err(SandboxError::UnsupportedLanguage(ctx.language)),
         };
 
-        // Slot 模型：用 SandboxResources 設定 cgroup 限制
+        // Resource-based：用 SandboxResources 設定 cgroup 限制
         let nsjail_timeout = ctx.timeout_secs + 15;
         let config_content = template
             .replace("{JOB_DIR}", &ctx.job_dir)
@@ -6875,7 +7098,7 @@ impl Sandbox for K8sPodSandbox {
         let image = ctx.custom_image.as_deref().unwrap_or(&self.config.default_image);
         let pod_name = format!("cf-job-{}", ctx.job_id);
 
-        // Slot 模型：用 SandboxResources 設定 Pod resource limits
+        // Resource-based：用 SandboxResources 設定 Pod resource limits
         let cpu_limit = format!("{}m", (ctx.resource_limits.cpus * 1000.0) as u64);
         let mem_limit = format!("{}Mi", ctx.resource_limits.memory / 1024 / 1024);
 
@@ -6961,8 +7184,8 @@ pub struct FirecrackerConfig {
     pub kernel_image: String,         // vmlinux 路徑
     pub rootfs_image: String,         // ext4 rootfs 路徑
     pub api_socket_dir: String,       // /tmp/coveflow/fc/
-    pub vcpu_count: u32,              // 預設由 slot 決定
-    pub mem_size_mib: u32,            // 預設由 slot 決定
+    pub vcpu_count: u32,              // 預設由 job.cpus 決定
+    pub mem_size_mib: u32,            // 預設由 job.memory_mb 決定
 }
 ```
 
@@ -6988,10 +7211,10 @@ pub struct K8sPodConfig {
 }
 
 // NsjailConfig 不再需要 memory_limit / cpu_time_limit / tmpfs_size，
-// 這些由 Slot 模型的 SandboxResources 動態提供：
-//   ctx.resource_limits.memory  → nsjail cgroup 限制
-//   ctx.resource_limits.disk    → nsjail tmpfs_size
-//   ctx.resource_limits.cpus    → nsjail cgroup CPU quota
+// 這些由 Resource-based 模型的 SandboxResources 動態提供：
+//   ctx.resource_limits.memory  → nsjail cgroup 限制（直接來自 job.memory_mb）
+//   ctx.resource_limits.disk    → nsjail tmpfs_size（直接來自 job.disk_mb）
+//   ctx.resource_limits.cpus    → nsjail cgroup CPU quota（直接來自 job.cpus）
 //   ctx.resource_limits.timeout → nsjail timeout
 ```
 
@@ -7004,18 +7227,22 @@ pub struct K8sPodConfig {
 name = "worker-01"
 tags = ["default"]
 
-# Slot 資源模型
-slots = 4                        # 總 slot 數（省略時自動偵測）
-[worker.slot]
-cpus = 2                         # 每 slot 的 vCPU 數
-memory = "8GB"                   # 每 slot 的 RAM
-disk = "10GB"                    # 每 slot 的磁碟（sandbox 限制）
-timeout = 300                    # 每 job 最大執行秒數
+# 資源總量（省略 = 自動偵測 - reserved）
+# total_cpus = 8             # 手動指定
+# total_memory_mb = 32768    # 手動指定
+# total_disk_mb = 102400     # 手動指定
+
+# 每 job 預設上限（job 沒設定時用這個）
+default_job_cpus = 1
+default_job_memory_mb = 512
+default_job_disk_mb = 1024
+job_timeout_secs = 300
 
 # 同機部署時的資源預留（省略時為 0）
 [worker.reserved]
 cpu = 1                          # 預留給 API Server / OS 的 CPU
 memory_mb = 1024                 # 預留 memory (MB)
+disk_mb = 0                      # 預留 disk (MB)
 
 # === 沙箱模式 1：nsjail（VM/Bare Metal 預設）===
 [worker.sandbox.nsjail]
@@ -7118,7 +7345,7 @@ macOS / Windows 開發環境：
 │  │  ┌─ Flow Job ──────────────────────────────┐                               │  │
 │  │  │  id: uuid-001                           │                               │  │
 │  │  │  kind: flow                             │                               │  │
-│  │  │  folder_owner: "ml-team" ───────────────────> Layer 5 quota check       │  │
+│  │  │  folder_owner: "ml-team" ─────> L5a concurrent + L5b cpu + L5c mem check │  │
 │  │  │  tag: "default"                         │                               │  │
 │  │  │  priority: 0                            │                               │  │
 │  │  │       │                                 │                               │  │
@@ -7139,8 +7366,8 @@ macOS / Windows 開發環境：
 │  │  │ L2: worker_config.max_concurrent_jobs (global cap)                  │   │  │
 │  │  │ L3: concurrency_limit per tag (tag-level cap)                       │   │  │
 │  │  │ L4: Worker backpressure (LISTEN/NOTIFY + poll interval)             │   │  │
-│  │  │ L5: group_quota.max_concurrent_jobs (team-level cap)                │   │  │
-│  │  │ L6: Worker Slot availability (slots_required <= available_slots)    │   │  │
+│  │  │ L5: group_quota (team-level: max_concurrent_jobs + max_cpus/memory)   │   │  │
+│  │  │ L6: Worker resource availability (cpus/mem/disk <= available)       │   │  │
 │  │  └─────────────────────────────────────────────────────────────────────┘   │  │
 │  └────────────────────────────────────────────────────────────────────────────┘  │
 │             │                                                                    │
@@ -7150,24 +7377,24 @@ macOS / Windows 開發環境：
 │  │                                                                            │  │
 │  │  ┌─ Worker 1 ────────────────────┐  ┌─ Worker 2 ───────────┐  ┌─ Worker N ──────┐  │  │
 │  │  │ tags: [default, gpu]          │  │ tags: [default]      │  │ tags: [heavy]   │  │  │
-│  │  │ slots: 4 (2cpu/8GB per slot)  │  │ slots: 2             │  │ slots: 4        │  │  │
+│  │  │ 8 cpu, 32GB, 100GB disk     │  │ 4 cpu, 16GB          │  │ 8 cpu, 64GB     │  │  │
 │  │  │                               │  │                      │  │                 │  │  │
-│  │  │ ┌─ SlotManager ────────────┐  │  │ ┌─ SlotManager ────┐ │  │                 │  │  │
-│  │  │ │ [████░░░░] 2/4 used      │  │  │ │ [██░░] 1/2 used  │ │  │                 │  │  │
-│  │  │ │ Slot 0: Job A (Normal)   │  │  │ │ Slot 0: Job D    │ │  │                 │  │  │
-│  │  │ │ Slot 1: Job B (Normal)   │  │  │ │ Slot 1: (free)   │ │  │                 │  │  │
-│  │  │ │ Slot 2: (free)           │  │  │ └──────────────────┘ │  │                 │  │  │
-│  │  │ │ Slot 3: (free)           │  │  │                      │  │                 │  │  │
+│  │  │ ┌─ ResourceManager ────────┐  │  │ ┌─ ResourceMgr ────┐ │  │                 │  │  │
+│  │  │ │ CPU [████░░░░] 4/8 used  │  │  │ │ CPU [██░░] 1/4   │ │  │                 │  │  │
+│  │  │ │ RAM [██░░░░░░] 8/32 GB   │  │  │ │ RAM [█░░░] 2/16  │ │  │                 │  │  │
+│  │  │ │ Job A: 2cpu 4GB (Normal) │  │  │ │ Job D: 1cpu 2GB  │ │  │                 │  │  │
+│  │  │ │ Job B: 2cpu 4GB (Normal) │  │  │ └──────────────────┘ │  │                 │  │  │
+│  │  │ │ free: 4cpu 24GB          │  │  │                      │  │                 │  │  │
 │  │  │ └──────────────────────────┘  │  │ ┌─ Sandbox ────────┐ │  │                 │  │  │
 │  │  │                               │  │ │ mode: none       │ │  │                 │  │  │
 │  │  │ ┌─ Sandbox ────────────────┐  │  │ │ (dev mode)       │ │  │                 │  │  │
 │  │  │ │ mode: nsjail             │  │  │ └──────────────────┘ │  │                 │  │  │
-│  │  │ │ resources: per-slot      │  │  └──────────────────────┘  └─────────────────┘  │  │
+│  │  │ │ resources: per-job       │  │  └──────────────────────┘  └─────────────────┘  │  │
 │  │  │ └────────────┬─────────────┘  │                                                │  │
 │  │  │              │                 │                                                │  │
 │  │  │              ▼                 │                                                │  │
 │  │  │  ┌─ Job Execution ──────────────────────────────────┐                           │  │
-│  │  │  │ 1. SlotManager.acquire(slots_required)           │                           │  │
+│  │  │  │ 1. rm.try_acquire(cpus, mem, disk)               │                           │  │
 │  │  │  │ 2. mkdir job_dir                                 │                           │  │
 │  │  │  │ 3. write code (main.py + wrapper.py)             │                           │  │
 │  │  │  │ 4. resolve dependencies (pip install, cached)    │                           │  │
@@ -7175,13 +7402,13 @@ macOS / Windows 開發環境：
 │  │  │  │ 6. spawn process in sandbox (resource_limits)    │                           │  │
 │  │  │  │ 7. stream stdout/stderr ──> job_log -> SSE -> UI │                           │  │
 │  │  │  │ 8. read result.json ──> job_completed (or S3)    │                           │  │
-│  │  │  │ 9. drop(SlotGuard) -> release slots              │                           │  │
+│  │  │  │ 9. drop(ResourceGuard) -> release resources      │                           │  │
 │  │  │  └──────────────────────────────────────────────────┘                           │  │
 │  │  └────────────────────────────────┘                                                │  │
 │  └────────────────────────────────────────────────────────────────────────────────────┘  │
 │                                                                                          │
 │  ┌─ Observability ────────────────────────────────────────────────────────────────────┐  │
-│  │  worker_ping: every 15s reports slots (total/used) + CPU/RAM/Disk -> Dashboard     │  │
+│  │  worker_ping: every 15s reports resources (cpus/mem/disk used/total) -> Dashboard   │  │
 │  │  group_resource_usage: per-team aggregation (jobs, duration, storage)              │  │
 │  │  OTel tracing: each job = 1 span, flow children inherit parent trace_id            │  │
 │  └────────────────────────────────────────────────────────────────────────────────────┘  │
@@ -7201,11 +7428,12 @@ macOS / Windows 開發環境：
 | Root Job | Child Jobs | 1 : N (per step) | `job.parent_job` / `job.root_job` |
 | Job | Worker | N : 1 (claimed) | `job_queue.worker` |
 | Job | Team | N : 1 | `job.folder_owner` |
-| Worker | Resources | 1 : 1 | `worker_ping.vcpus / memory / disk` |
-| Worker | Slots | 1 : N | `worker_ping.total_slots / used_slots` |
+| Worker | Resources | 1 : 1 | `worker_ping.total_cpus / used_cpus / total_memory_mb / used_memory_mb / total_disk_mb / used_disk_mb` |
 | Worker | Sandbox | 1 : 1 | `worker_ping.sandbox_mode` |
-| Job | Slots Required | 1 : 1 | `job.slots_required` (default 1) |
-| Team Quota | Job Queue | throttle | Layer 5 in `push_job` + `pull_job` |
+| Job | Resources Required | 1 : 1 | `job.cpus` (default 1), `job.memory_mb` (default 512), `job.disk_mb` (default 1024) |
+| Team Quota (concurrency) | Job Queue | throttle | L5a: `max_concurrent_jobs` in `push_job` + `pull_job` |
+| Team Quota (cpus) | Job Queue | throttle | L5b: `max_cpus` — SUM(cpus) cap in `push_job` + `pull_job` |
+| Team Quota (memory) | Job Queue | throttle | L5c: `max_memory_mb` — SUM(memory_mb) cap in `push_job` + `pull_job` |
 
 ### B.2 FAQ: Resource Model Clarifications
 
@@ -7259,7 +7487,7 @@ The deployment environment, not the application. Workers auto-detect on startup.
 
 **Q: Does a Group own specific workers?**
 
-No. All workers are shared. Group quota only limits concurrency.
+No. All workers are shared. Group quota limits **concurrency + hardware usage**, not worker ownership.
 
 ```
 WRONG (Kubernetes-style mental model):
@@ -7267,13 +7495,16 @@ WRONG (Kubernetes-style mental model):
   data-eng "owns" Worker 4, 5
 
 CORRECT (CoveFlow model):
-  All 20 workers are in a shared pool.
+  All 20 workers (total 160 cpus, 640 GB RAM) are in a shared pool.
   Any worker can pick up any team's job.
-  group_quota.max_concurrent_jobs = 10 means:
-    -> at most 10 of ml-team's jobs run at the same time
-    -> does NOT reserve 10 workers exclusively
 
-  If ml-team has 0 running jobs, all 20 workers
+  group_quota for ml-team:
+    max_concurrent_jobs = 10    -> at most 10 jobs run at the same time
+    max_cpus = 16               -> those jobs can consume at most 16 cpus total
+    max_memory_mb = 32768       -> those jobs can consume at most 32 GB RAM total
+
+  Neither setting reserves workers exclusively.
+  If ml-team has 0 running jobs, all cluster resources
   are available to other teams.
 ```
 
@@ -7295,7 +7526,9 @@ To prevent one team from filling shared storage with large files (ML models, dat
 
 | Quota field | Priority | Reason |
 |-------------|----------|--------|
-| `max_concurrent_jobs` | **High** | Prevents resource starvation across teams |
+| `max_concurrent_jobs` | **High** | Prevents job count starvation across teams |
+| `max_cpus` | **High** | Prevents CPU starvation — 限制團隊佔用的 CPU 總量 |
+| `max_memory_mb` | **High** | Prevents RAM starvation — 限制團隊佔用的 RAM 總量 |
 | `max_daily_jobs` | Medium | Cost control, abuse prevention |
 | `max_storage_bytes` | Low | Only matters if using local disk, S3 is ~infinite |
 | `max_job_timeout_secs` | Low | Safety net, global default usually sufficient |
