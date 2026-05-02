@@ -869,6 +869,7 @@ CREATE TABLE script (
     schema JSONB,                      -- JSON Schema（函式簽名）
     parent_hashes TEXT[],              -- 版本鏈
     summary TEXT DEFAULT '',
+    requirements TEXT[] NOT NULL DEFAULT '{}',  -- pip packages: ["pandas>=2.0", "requests"]
     created_by VARCHAR(255) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace_id, hash)
@@ -899,6 +900,7 @@ CREATE TABLE job (
     cpus REAL NOT NULL DEFAULT 1,                -- 此 job 需要多少 vCPU
     memory_mb INTEGER NOT NULL DEFAULT 512,      -- 此 job 需要多少 MB RAM
     disk_mb INTEGER NOT NULL DEFAULT 1024,       -- 此 job 需要多少 MB 磁碟空間
+    requirements TEXT[] NOT NULL DEFAULT '{}',  -- copied from script, or inline for preview
     -- 團隊歸屬（從 script/flow path 自動推導）
     folder_owner VARCHAR(100),           -- NULL（個人 u/...）或 folder 名（f/ml-team/...）
     created_by VARCHAR(255) NOT NULL,
@@ -1296,9 +1298,12 @@ pub async fn handle_python_job(
     job_dir: &str,
     sandbox: &dyn Sandbox,  // ← 注入的沙箱
 ) -> Result<serde_json::Value> {
-    let requirements = parse_python_imports(content);
-    if !requirements.is_empty() {
-        install_python_deps(&requirements, job_dir, db).await?;
+    // Requirements are user-specified in the frontend rather than auto-parsed from imports.
+    // This avoids the fragility of import parsing (e.g., `import cv2` requires `opencv-python`,
+    // not `cv2`), gives users explicit control over version pinning, and eliminates the need
+    // for a Python stdlib allowlist.
+    if !job.requirements.is_empty() {
+        install_python_deps(&job.requirements, job_dir, sandbox).await?;
     }
 
     write_file(job_dir, "inner.py", content)?;
@@ -1927,9 +1932,9 @@ async fn handle_job(
     match job.kind.as_str() {
         "flow" | "flow_preview" => handle_flow_job(job, db, job_dir, sandbox).await,
         _ => {
-            let (content, language) = get_job_content(job, db).await?;
+            let (content, language, requirements) = get_job_content(job, db).await?;
             match language {
-                ScriptLang::Python3 => handle_python_job(job, db, &content, job_dir, sandbox).await,
+                ScriptLang::Python3 => handle_python_job(job, &content, job_dir, sandbox).await,
                 ScriptLang::Bash => handle_bash_job(job, db, &content, job_dir, sandbox).await,
                 ScriptLang::TypeScript => handle_ts_job(job, db, &content, job_dir, sandbox).await,
                 ScriptLang::DuckDB => handle_duckdb_job(job, db, &content, job_dir).await,
@@ -2288,10 +2293,10 @@ pub async fn create_script(
     };
 
     sqlx::query!(
-        "INSERT INTO script (workspace_id, hash, path, content, language, schema, parent_hashes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "INSERT INTO script (workspace_id, hash, path, content, language, schema, parent_hashes, requirements, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         workspace_id, hash, req.path, req.content,
-        req.language.as_str(), schema, &parent_hashes, user.email
+        req.language.as_str(), schema, &parent_hashes, &req.requirements, user.email
     ).execute(&state.db).await?;
 
     Ok(Json(ScriptCreated { hash }))
@@ -2330,6 +2335,7 @@ pub async fn run_script_by_path(
         args: Some(args),
         tag: "default",
         folder_owner: folder_owner.as_deref(),
+        requirements: script.requirements.clone(),
         created_by: &user.email,
         trace_id: current_trace_id(),
         span_id: current_span_id(),
@@ -2361,6 +2367,7 @@ pub async fn run_preview(
         language: Some(req.language),
         args: req.args,
         tag: req.tag.as_deref().unwrap_or("default"),
+        requirements: req.requirements.unwrap_or_default(),
         created_by: &user.email,
         trace_id: current_trace_id(),
         span_id: current_span_id(),
@@ -2659,10 +2666,12 @@ pub async fn stream_job_logs(
   let {
     content = $bindable(),
     language = 'python',
+    requirements = $bindable([]),
     onRun,
   }: {
     content: string
     language?: string
+    requirements?: string[]
     onRun?: (content: string) => void
   } = $props()
 
@@ -2700,6 +2709,18 @@ pub async fn stream_job_logs(
     </select>
     <button onclick={() => onRun?.(content)}>Run</button>
   </div>
+  {#if language === 'python3' || language === 'typescript'}
+    <div class="requirements-input">
+      <label>Dependencies (one per line)</label>
+      <textarea
+        placeholder="pandas>=2.0&#10;requests&#10;numpy"
+        oninput={(e) => {
+          requirements = e.target.value.split('\n').map(s => s.trim()).filter(Boolean)
+        }}
+        value={requirements.join('\n')}
+      ></textarea>
+    </div>
+  {/if}
   <div bind:this={editorContainer} class="editor-container"></div>
 </div>
 
