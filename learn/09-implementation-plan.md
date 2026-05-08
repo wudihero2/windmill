@@ -907,7 +907,9 @@ CREATE TABLE job (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- OTel trace context
     trace_id CHAR(32),
-    span_id CHAR(16)
+    span_id CHAR(16),
+    -- Run Operations（詳見 11-run-operations.md）
+    rerun_of UUID REFERENCES job(id)    -- 若為重跑，指向原始 run
 );
 
 -- job_queue：可變狀態（Worker 用 FOR UPDATE SKIP LOCKED 搶）
@@ -919,11 +921,19 @@ CREATE TABLE job_queue (
     tag VARCHAR(50) NOT NULL DEFAULT 'default',
     priority SMALLINT NOT NULL DEFAULT 0,
     worker VARCHAR(100),
-    last_ping TIMESTAMPTZ
+    last_ping TIMESTAMPTZ,
+    -- Run Operations（詳見 11-run-operations.md）
+    canceled_by VARCHAR(255),               -- 誰取消的（NULL = 未取消）
+    canceled_reason TEXT,                    -- 取消原因
+    cancel_requested_at TIMESTAMPTZ         -- 取消請求時間
 );
 
 CREATE INDEX idx_job_queue_pull ON job_queue(scheduled_for, priority DESC)
     WHERE running = FALSE;
+
+-- 已取消但仍在執行的 run（worker 偵測用）
+CREATE INDEX idx_job_queue_cancel ON job_queue(id)
+    WHERE canceled_by IS NOT NULL AND running = TRUE;
 
 -- job_completed：結果（完成後從 job_queue 刪除，插入這裡）
 CREATE TABLE job_completed (
@@ -933,7 +943,12 @@ CREATE TABLE job_completed (
     result_s3_key VARCHAR(255),        -- 大結果存 S3
     duration_ms INTEGER NOT NULL,
     memory_peak_bytes BIGINT,
-    completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Run Operations（詳見 11-run-operations.md）
+    canceled_by VARCHAR(255),          -- 取消者（cancel_run / force_cancel_run 寫入）
+    canceled_reason TEXT,              -- 取消原因
+    marked_by VARCHAR(255),            -- 標記者（mark_success / mark_fail 寫入）
+    mark_reason TEXT                   -- 標記原因
 );
 
 -- run_log：Run 執行日誌（分塊儲存，設計詳見 10-log-and-ha.md §1.4）
@@ -1524,6 +1539,7 @@ pub async fn pull_job(
             JOIN job j ON j.id = jq.id
             WHERE jq.running = FALSE
               AND jq.scheduled_for <= now()
+              AND jq.canceled_by IS NULL      -- 跳過已取消的 run（11-run-operations.md）
               AND jq.tag = ANY($1)
               -- L6a: CPU 可用性
               AND j.cpus <= $3
@@ -2048,6 +2064,12 @@ pub fn create_router(db: PgPool, sandbox: Arc<SandboxRouter>) -> Router {
             .route("/jobs/:id/logs/stream", get(sse::stream_job_logs))
             .route("/jobs/:id/flow_status", get(jobs::get_flow_status))
             .route("/jobs/list", get(jobs::list_jobs))
+            // Run Operations（詳見 11-run-operations.md）
+            .route("/runs/:id/cancel", post(runs::cancel_run))
+            .route("/runs/:id/force-cancel", post(runs::force_cancel_run))
+            .route("/runs/:id/rerun", post(runs::rerun))
+            .route("/runs/:id/mark-success", post(runs::mark_success))
+            .route("/runs/:id/mark-fail", post(runs::mark_fail))
             // Resources
             .route("/resources/types", get(resources::list_types).post(resources::create_type))
             .route("/resources/list", get(resources::list_resources))
@@ -3004,6 +3026,14 @@ npm run dev  # http://localhost:5173
 7. 同步超時：設 timeout=1 + 放一個 sleep(5) script → 確認收到 timeout 錯誤
 8. 斷線取消：curl 發 run_wait_result 後 Ctrl+C → 確認 job 被 canceled_by='http_disconnect'
 9. 佇列反壓：設 queue_limit=2 → 同時發 5 個 sync 請求 → 後 3 個收到 503
+
+# Run Operations（詳見 11-run-operations.md §9 驗證方式）
+10. Cancel：sleep(60) script → Run → Cancel → 確認 worker 收到 SIGINT → run 標記 canceled
+11. Cancel（queued）：建立 scheduled_for=未來 的 run → Cancel → 確認直接完成
+12. Force Cancel：停掉 worker → running run 卡住 → Force Cancel → 確認標記失敗
+13. Rerun：已完成 run → Rerun → 確認新 run 使用相同參數，rerun_of 正確
+14. Mark Success/Fail：running run → Mark Success → 確認 run_completed.marked_by 有值
+15. 邊界：已完成 run → Cancel → AlreadyCompleted；不存在 run → NotFound
 ```
 
 ### 1.11 Resource-based 部署指南
