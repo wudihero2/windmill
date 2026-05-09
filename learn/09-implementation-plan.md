@@ -47,7 +47,7 @@
 | 部署審核 | 無（直接覆蓋） | **Deploy Approval Gate**：路徑級審核政策 + 多人審批 + diff 預覽 |
 | 集群資源可視化 | vCPU + 記憶體（無磁碟、無 CPU 使用率） | **完整 Dashboard**：CPU 使用率 + 記憶體 + 磁碟 + 佔用率 |
 | 檔案上傳 | S3 上傳 + SDK 存取（EE 功能） | **File Storage**：S3 / 本地雙模式 + 拖拉上傳 + 檔案瀏覽器 |
-| 多團隊 RBAC | Group + Folder + extra_perms | **Group + Folder + ACL + Quota**：團隊配額（併發+CPU/RAM+儲存）+ 路徑級讀寫控制 |
+| 多團隊 RBAC | Group + Folder + extra_perms JSONB | **Team + Folder + folder_acl + Quota**：正規化 ACL 表 + 團隊配額（併發+CPU/RAM+儲存）|
 
 ---
 
@@ -89,9 +89,9 @@ coveflow/
 │       │       ├── deploy.rs        # Deploy Approval Gate（審核政策 + 部署請求）
 │       │       ├── files.rs         # File Storage（上傳/下載/列表/預覽）
 │       │       ├── cluster.rs       # Cluster Dashboard（worker 資源監控）
-│       │       ├── groups.rs        # Group CRUD + 成員管理
-│       │       ├── folders.rs       # Folder CRUD + ACL 管理
-│       │       ├── acl.rs           # 權限檢查（require_reader/writer/owner）
+│       │       ├── teams.rs          # Team CRUD + member management
+│       │       ├── folders.rs       # Folder CRUD + ACL management (folder_acl table)
+│       │       ├── acl.rs           # Permission checks (require_reader/writer/owner on AuthedUser)
 │       │       └── sse.rs             # SSE 日誌串流（chunk-based run_log）
 │       ├── types/                 # 領域型別
 │       │   ├── Cargo.toml         # deps: serde, uuid, chrono
@@ -498,7 +498,7 @@ def main(db: dict, api_key: str):
 **使用場景**：把 CoveFlow 當作 API 使用——外部系統呼叫 workflow，阻塞等待結果後回傳。
 
 ```
-典型情境：貸款系統 → POST /api/w/prod/jobs/run_wait_result/f/credit-scoring
+典型情境：貸款系統 → POST /api/workspaces/prod/jobs/run_wait_result/f/credit-scoring
          → CoveFlow 執行信用評分 flow
          → HTTP 阻塞等待
          → 200 OK { "score": 720, "approved": true }
@@ -619,7 +619,7 @@ Runner Group:       ~5ms  + ~0ms  + exec     ≈ 5ms + exec
 使用者拖拉上傳
     │
     ▼
-POST /api/w/{ws}/files/upload
+POST /api/workspaces/{ws}/files/upload
     │
     ├── storage_mode = "s3"  → 上傳到 S3/MinIO
     │                          回傳 FileRef { s3: "uploads/2025/data.csv" }
@@ -654,11 +654,11 @@ Worker 執行前自動處理：
 
 | 平台 | 團隊/群組 | 路徑 ACL | 團隊配額 |
 |------|----------|---------|---------|
-| Windmill | ✅ Group + Folder + extra_perms | ✅ 路徑級讀/寫/owner | ❌ 無 |
+| Windmill | ✅ Group + Folder + extra_perms JSONB | ✅ 路徑級讀/寫/owner | ❌ 無 |
 | Airflow | ❌ 靠外部 LDAP | ❌ DAG-level role | ❌ 無 |
 | Prefect | ❌ workspace 級 | ❌ 無路徑 ACL | ❌ 無 |
 | Kestra | ✅ Namespace 級（EE） | ❌ 粗粒度 | ❌ 無 |
-| **CoveFlow** | **✅ Group + Folder** | **✅ extra_perms（讀/寫/owner）** | **✅ 團隊級配額（併發+CPU/RAM+儲存）** |
+| **CoveFlow** | **✅ Team + Folder + folder_acl** | **✅ 正規化 ACL（reader/writer/owner）** | **✅ 團隊級配額（併發+CPU/RAM+儲存）** |
 
 **核心設計（學 Windmill，加入團隊配額）**：
 
@@ -691,26 +691,28 @@ folders/ml-team/training    → 團隊路徑，由 folder ACL 控制
 folders/shared/utils        → 共用路徑，所有人可讀
 ```
 
-**ACL 模型（`extra_perms` JSONB）**：
+**ACL 模型（正規化 `folder_acl` 表）**：
 
-```json
-{
-    "users/alice": true,       // alice 可讀寫
-    "teams/ml-team": true,     // ml-team 成員可讀寫
-    "teams/data-eng": false,   // data-eng 成員唯讀
-    "teams/all": false         // 其他人唯讀
-}
-// true = 讀寫，false = 唯讀，key 不存在 = 無權限
+Windmill 用 `owners TEXT[]` + `extra_perms JSONB` 雙軌存權限，查詢需要 `LATERAL jsonb_each()` + `unnest()` + `UNION`。
+CoveFlow 採用正規化關聯表，用標準 SQL 即可查詢：
+
+```sql
+-- folder_acl 表中的記錄範例
+(workspace_id='acme', folder_name='ml-team', subject='teams/ml-team',  role='owner')
+(workspace_id='acme', folder_name='ml-team', subject='users/bob',      role='writer')
+(workspace_id='acme', folder_name='ml-team', subject='teams/data-eng', role='reader')
 ```
+
+三級角色：`owner`（完全控制）> `writer`（讀寫）> `reader`（唯讀），key 不存在 = 無權限。
 
 **權限檢查優先序**：
 
 ```
 1. is_admin? → 全部放行
 2. path 以 "users/{username}/" 開頭？ → 只有本人可讀寫
-3. path 以 "folders/{folder}/" 開頭？ → 查 folder.extra_perms
-   → 先查 users/{username}，再查 teams/{teams}
-   → 第一個 match 決定權限
+3. path 以 "folders/{folder}/" 開頭？ → 查 folder_acl 表
+   → 找出所有 subject ∈ perm_subjects 的記錄
+   → 取最高角色（owner > writer > reader）
 4. 都沒 match → 無權限（403）
 ```
 
@@ -754,9 +756,9 @@ folders/shared/utils        → 共用路徑，所有人可讀
 
 | 現有段落 | 需要修改 |
 |---------|---------|
-| Phase 1 Schema | 新增 `team`、`team_member`、`folder`、`team_quota`（含 `max_cpus, max_memory_mb`）表 |
-| Phase 1 Auth | `AuthedUser` 增加 groups + folders 欄位 |
-| Phase 1 Router | 新增 Group / Folder / Quota API 路由 |
+| Phase 1 Schema | 新增 `team`、`team_member`、`folder`、`folder_acl`、`team_quota`（含 `max_cpus, max_memory_mb`）表 |
+| Phase 1 Auth | `AuthedUser` 增加 teams + folders（`FolderRole` enum）欄位 |
+| Phase 1 Router | 新增 Team / Folder / Quota API 路由 |
 | Phase 1 Script CRUD | 加 `require_writer(path)` 檢查 |
 | Phase 1 Job push | 加團隊歸屬 + 配額檢查（併發 + CPU/RAM 雙重） |
 | Phase 1 Job pull | L5 子查詢加 `max_cpus` + `max_memory_mb` 用量檢查 |
@@ -806,10 +808,22 @@ CREATE TABLE team (
     workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
     name VARCHAR(100) NOT NULL,              -- "ml-team", "sre", "data-eng"
     summary TEXT DEFAULT '',
-    -- 額外權限（可讀/寫指定路徑，含 folder 路徑）
-    extra_perms JSONB NOT NULL DEFAULT '{}', -- {"users/alice": true, "teams/sre": false}
     PRIMARY KEY (workspace_id, name)
 );
+
+-- 團隊管理權限（誰可以新增/移除成員）
+-- admin 永遠可以管理所有 team；team_acl 用於委派管理權給非 admin
+CREATE TABLE team_acl (
+    workspace_id VARCHAR(50)  NOT NULL,
+    team_name    VARCHAR(100) NOT NULL,
+    subject      VARCHAR(255) NOT NULL,  -- 'users/alice' or 'teams/sre'
+    role         VARCHAR(20)  NOT NULL CHECK (role IN ('manager')),
+    PRIMARY KEY (workspace_id, team_name, subject),
+    FOREIGN KEY (workspace_id, team_name)
+        REFERENCES team(workspace_id, name) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_team_acl_subject ON team_acl(workspace_id, subject);
 
 -- 使用者 ↔ 團隊 對應
 CREATE TABLE team_member (
@@ -821,18 +835,28 @@ CREATE TABLE team_member (
 );
 
 -- 資料夾（路徑級 ACL 的核心）
--- 所有 folders/ 開頭的路徑都由 folder 管理權限
+-- 所有 folders/ 開頭的路徑都由 folder + folder_acl 管理權限
 CREATE TABLE folder (
     workspace_id VARCHAR(50) NOT NULL REFERENCES workspace(id),
     name VARCHAR(100) NOT NULL,              -- "ml-team", "production", "shared"
     display_name VARCHAR(255) DEFAULT '',
-    owners TEXT[] NOT NULL DEFAULT '{}',      -- 完全控制權：['users/alice', 'teams/sre']
-    -- 額外權限：讀/寫控制
-    -- key = permission subject (users/alice, teams/ml-team)
-    -- value = true (read+write), false (read-only)
-    extra_perms JSONB NOT NULL DEFAULT '{}', -- {"users/bob": false, "teams/data-eng": true}
     PRIMARY KEY (workspace_id, name)
 );
+
+-- Folder 權限控制（正規化設計，取代 Windmill 的 owners TEXT[] + extra_perms JSONB）
+-- 三級角色：owner（完全控制）> writer（讀寫）> reader（唯讀）
+CREATE TABLE folder_acl (
+    workspace_id VARCHAR(50)  NOT NULL,
+    folder_name  VARCHAR(100) NOT NULL,
+    subject      VARCHAR(255) NOT NULL,  -- 'users/alice' or 'teams/backend'
+    role         VARCHAR(20)  NOT NULL CHECK (role IN ('owner', 'writer', 'reader')),
+    PRIMARY KEY (workspace_id, folder_name, subject),
+    FOREIGN KEY (workspace_id, folder_name)
+        REFERENCES folder(workspace_id, name) ON DELETE CASCADE
+);
+
+-- Auth middleware 用：快速查出某使用者可存取的所有 folder
+CREATE INDEX idx_folder_acl_subject ON folder_acl(workspace_id, subject);
 
 -- 團隊資源配額（Windmill 沒有，CoveFlow 獨有）
 CREATE TABLE team_quota (
@@ -2034,7 +2058,7 @@ pub fn create_router(db: PgPool, sandbox: Arc<SandboxRouter>) -> Router {
     Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/signup", post(auth::signup))
-        .nest("/api/w/:workspace_id", Router::new()
+        .nest("/api/workspaces/:workspace_id", Router::new()
             // Scripts
             .route("/scripts/create", post(scripts::create_script))
             .route("/scripts/list", get(scripts::list_scripts))
@@ -2135,6 +2159,293 @@ pub fn create_router(db: PgPool, sandbox: Arc<SandboxRouter>) -> Router {
 }
 ```
 
+#### Axum 架構：Extractor / Handler / Middleware
+
+Axum 是 Tokio 團隊開發的 web framework，採用 **Type-Directed Dispatch**（型別導向分派）設計模式：
+**型別本身就是指令，告訴框架要做什麼**。所有提取、驗證、組裝都在編譯期完成，零 runtime 成本。
+
+##### 設計模式：Type-Directed Dispatch
+
+傳統框架（Flask/Express）要手動從 request 取資料，忘了取就 runtime 報錯：
+
+```python
+# Python Flask — 手動從 request 拿東西
+@app.route("/login", methods=["POST"])
+def login():
+    db = get_db()                    # 手動取 DB
+    body = request.get_json()        # 手動解析 body
+    workspace = request.args["ws"]   # 手動取 query param
+    # 忘了取？runtime 才會炸
+```
+
+Axum 只要宣告參數型別，框架自動提取。少寫或寫錯 → 編譯期直接報錯：
+
+```rust
+async fn login(
+    State(db): State<PgPool>,        // 寫了這個型別 → 框架知道要注入 DB
+    Json(body): Json<LoginRequest>,  // 寫了這個型別 → 框架知道要解析 JSON
+    Path(ws): Path<String>,          // 寫了這個型別 → 框架知道要從 URL 取
+) -> Result<Json<LoginResponse>, ApiError> { ... }
+```
+
+##### 三個核心概念
+
+**1. Handler（處理函式）**
+
+任何滿足 `Handler` trait 的 async function。參數是 Extractor，回傳值實作 `IntoResponse`：
+
+```rust
+// Handler：就是普通的 async fn
+async fn create_run(
+    State(state): State<AppState>,          // Extractor 1: 從 app state 提取
+    Path(workspace_id): Path<String>,       // Extractor 2: 從 URL path 提取
+    Extension(user): Extension<AuthedUser>, // Extractor 3: 從 middleware 注入
+    Json(req): Json<CreateRunRequest>,      // Extractor 4: 從 request body 反序列化
+) -> Result<Json<RunResponse>, ApiError> {  // 回傳值自動轉成 HTTP response
+    // state.db 就是 PgPool
+    // workspace_id 就是 String
+    // user 就是 AuthedUser
+    // req 就是 CreateRunRequest
+}
+```
+
+回傳值支援多種 tuple 組合，自動轉成 HTTP response：
+
+```rust
+StatusCode                                       // 只有狀態碼（空 body）
+String                                           // text/plain body
+Json<T>                                          // JSON body（預設 200）
+(StatusCode, Json<T>)                            // 狀態碼 + JSON body
+(StatusCode, [(HeaderName, &str)], Json<T>)      // 狀態碼 + headers + body
+```
+
+**2. Extractor（提取器）**
+
+每個 Extractor 實作 `FromRequestParts` trait，告訴 Axum「怎麼從 request 中把自己提取出來」：
+
+```rust
+// Axum 內部的 trait 定義
+trait FromRequestParts<S> {
+    type Rejection: IntoResponse;  // 提取失敗時的錯誤型別
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection>;
+}
+
+// 每個 Extractor 各自實作
+impl FromRequestParts for State<S>       { /* 從 app state 拿 */ }
+impl FromRequestParts for Path<String>   { /* 從 URL 解析 {param} */ }
+impl FromRequestParts for Extension<T>   { /* 從 middleware 注入的資料拿 */ }
+impl FromRequest      for Json<T>        { /* 從 body 反序列化 */ }
+```
+
+Axum 用 macro 對 0~16 個參數自動生成 Handler 實作（編譯期展開）：
+
+```rust
+// 編譯器看到 handler 的參數型別，自動生成提取程式碼（概念上）：
+async fn call(request: Request, state: S) -> Response {
+    let (mut parts, body) = request.into_parts();
+    // 按參數順序，依次呼叫每個型別的 from_request_parts
+    let arg1 = State::from_request_parts(&mut parts, &state).await?;
+    let arg2 = Path::from_request_parts(&mut parts, &state).await?;
+    let arg3 = Extension::from_request_parts(&mut parts, &state).await?;
+    let arg4 = Json::from_request(Request::from_parts(parts, body), &state).await?;
+    handler(arg1, arg2, arg3, arg4).await.into_response()
+}
+```
+
+**為什麼參數要「包起來」？** `State(db): State<PgPool>` 是 Rust 的解構模式。`State` 是 tuple struct：
+
+```rust
+pub struct State<S>(pub S);
+
+// 這兩種寫法等價：
+async fn handler(State(db): State<PgPool>) { /* 直接用 db */ }
+async fn handler(state: State<PgPool>) { let db = state.0; /* 多一行 */ }
+```
+
+**可自訂 Extractor**：實作 `FromRequestParts` 就能建立新的 extractor：
+
+```rust
+// 自訂 Extractor：從 header 取 request ID
+struct RequestId(String);
+
+impl<S: Send + Sync> FromRequestParts<S> for RequestId {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let id = parts.headers.get("X-Request-Id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown").to_string();
+        Ok(RequestId(id))
+    }
+}
+
+// 之後任何 handler 直接加這個型別就能用，不需要改框架或註冊
+async fn some_handler(RequestId(id): RequestId) {
+    tracing::info!(request_id = %id, "handling request");
+}
+```
+
+**3. Middleware（中介層）**
+
+Middleware 也是 async function，透過 `Extension` 在 request 中注入資料給後續 handler。
+固定參數是 `req: Request` 和 `next: Next`，可選加 `State`、`Path` 等 extractor：
+
+```rust
+// Middleware：JWT 驗證 → 查 DB → 注入 AuthedUser
+async fn require_auth(
+    State(db): State<PgPool>,              // 可選：需要 DB 就加 State
+    Path(workspace_id): Path<String>,      // 可選：需要 URL 參數就加 Path
+    mut req: Request,                      // 固定：原始 HTTP request
+    next: Next,                            // 固定：呼叫下一層
+) -> Result<Response, ApiError> {
+    let user = AuthedUser { /* ... 從 JWT + DB 建構 */ };
+    req.extensions_mut().insert(user);  // 注入到 request 的 extensions
+    Ok(next.run(req).await)             // 繼續往下走
+}
+
+// Handler：透過 Extension 提取 middleware 注入的資料
+async fn handler(Extension(user): Extension<AuthedUser>) { /* 直接用 user */ }
+```
+
+##### Router 組裝
+
+```rust
+Router::new()
+    // 公開路由（不經過 auth middleware）
+    .route("/api/auth/login", post(auth::login))
+    .route("/api/auth/signup", post(auth::signup))
+    // Workspace 路由（經過 auth middleware）
+    .nest("/api/workspaces/{workspace_id}", Router::new()
+        .route("/scripts/create", post(scripts::create_script))
+        .route("/runs/list", get(runs::list_runs))
+        .layer(auth_middleware)  // 只套用在這個子 Router
+    )
+    .with_state(db)  // 注入 PgPool，讓所有 handler 透過 State 提取
+```
+
+- `.nest(prefix, sub_router)` — 子 Router 的所有 route 自動加上 prefix，middleware 也只套用在子 Router 內
+- `.with_state(db)` — 注入共用資源，handler 透過 `State(db): State<PgPool>` 提取
+- `.layer(middleware)` — 掛載 middleware，只影響同一層的 route
+
+##### State 擴充：FromRef
+
+目前 CoveFlow 的 state 是 `PgPool`。未來需要共用更多資源時，可以包成 struct：
+
+```rust
+#[derive(Clone)]
+struct AppState { db: PgPool, sandbox: Arc<SandboxRouter> }
+
+// 實作 FromRef：告訴 Axum 怎麼從 AppState 取出 PgPool
+impl FromRef<AppState> for PgPool {
+    fn from_ref(state: &AppState) -> PgPool { state.db.clone() }
+}
+
+// 改 .with_state(AppState { db, sandbox })
+// 所有現有的 State(db): State<PgPool> 都不用改——Axum 自動透過 FromRef 提取
+```
+
+##### 與其他框架的比較
+
+| 框架 | 機制 | 檢查時機 | 成本 |
+|------|------|---------|------|
+| **Spring (Java)** | `@Autowired` 依賴注入 | Runtime 反射 | 啟動慢 |
+| **Angular (TS)** | Constructor DI | Runtime DI container | Runtime |
+| **FastAPI (Python)** | Type hints + `Depends()` | Runtime 解析 | Runtime |
+| **Axum (Rust)** | Trait + 泛型 | **編譯期**完成 | **零成本** |
+
+FastAPI 的設計最接近 Axum（都是看參數型別決定行為），但 FastAPI 是 runtime 解析，Axum 是編譯期完成。
+
+##### 為什麼 auth middleware 查 DB 是標準做法？
+
+幾乎所有框架都在 middleware 查 DB：Windmill（PG）、Airflow（Flask+SQLAlchemy）、Django（ORM）、Rails（Devise）。
+原因：(1) PgPool 連線池取連線 O(1)，(2) PRIMARY KEY 查詢 < 0.1ms，(3) 權限變更即時生效不需等 JWT 過期。
+替代方案（JWT 塞角色 / Redis cache）增加複雜度但對 < 1000 QPS 的內部工具沒有實際收益。
+
+#### JWT 機制與前後端互動
+
+**JWT 結構**
+
+JWT（JSON Web Token）是一個三段式的 Base64 字串，用 `.` 分隔：
+
+```
+eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiZXhwIjoxNzE1MjAwMDAwfQ.SIGNATURE
+├── Header ──────────┤├── Payload（Claims）───────────────────────────────────────────────┤├── Signature ┤
+```
+
+- **Header**（明文 Base64，任何人可讀）：`{"alg": "HS256"}` — 簽名演算法
+- **Payload**（明文 Base64，任何人可讀）：`{"email": "alice@example.com", "exp": 1715200000}` — 就是 Claims struct
+- **Signature**：`HMAC-SHA256(Header + "." + Payload, JWT_SECRET)` — 驗證用
+
+重點：Payload **不加密**，任何人都能 Base64 decode 看到內容。JWT 只保證**不可篡改**——改了任何一個字元，Signature 就對不上。
+
+JWT 規範（RFC 7519）定義的標準欄位：
+
+| 欄位 | 全名 | 用途 | CoveFlow |
+|------|------|------|----------|
+| `sub` | Subject | 代表誰 | 用 `email` 欄位取代 |
+| `exp` | Expiration | 過期時間 | ✅ 24 小時 |
+| `iss` | Issuer | 誰簽發的 | 暫不使用（單系統不需要） |
+| `aud` | Audience | 給誰用的 | 暫不使用（單系統不需要） |
+
+**JWT_SECRET 的角色**
+
+```
+簽發（login）：Claims + JWT_SECRET → Signature → token 發給 client
+驗證（middleware）：token + JWT_SECRET → 重算 Signature → 比對
+  一致 → 沒被篡改，信任 Claims
+  不一致 → 被竄改或密鑰錯誤 → 401
+```
+
+JWT_SECRET 洩漏 = 任何人都能偽造合法 token。正式環境必須設定強密鑰。
+
+**Validation::default()** 自動驗證 `exp`（過期）和 `alg`（演算法），對 CoveFlow 目前夠用。
+
+**前後端互動流程**
+
+```
+┌──────────┐                              ┌──────────┐                    ┌────┐
+│  Browser │                              │   API    │                    │ DB │
+└────┬─────┘                              └────┬─────┘                    └─┬──┘
+     │                                         │                            │
+     │  1. POST /api/auth/login                │                            │
+     │     { email, password }                 │                            │
+     │────────────────────────────────────────>│                            │
+     │                                         │  2. SELECT password_hash   │
+     │                                         │───────────────────────────>│
+     │                                         │  3. Argon2 驗證密碼         │
+     │                                         │     通過 → 簽發 JWT token  │
+     │  4. 200 { token: "eyJhbG..." }          │                            │
+     │<────────────────────────────────────────│                            │
+     │                                         │                            │
+     │  ── 前端存 token（見下方儲存方式）──       │                            │
+     │                                         │                            │
+     │  5. GET /api/workspaces/acme/runs/list  │                            │
+     │     Authorization: Bearer eyJhbG...     │                            │
+     │────────────────────────────────────────>│                            │
+     │                                         │  6. require_auth middleware │
+     │                                         │     a. decode JWT → email   │
+     │                                         │     b. 查 workspace_member  │
+     │                                         │     c. 查 team_member       │
+     │                                         │     d. 查 folder_acl        │
+     │                                         │     e. 注入 AuthedUser      │
+     │                                         │  7. Handler 執行            │
+     │  8. 200 { runs: [...] }                 │                            │
+     │<────────────────────────────────────────│                            │
+     │                                         │                            │
+     │  ── 24 小時後 token 過期 ──              │                            │
+     │                                         │                            │
+     │  9. 請求帶過期 token                     │                            │
+     │────────────────────────────────────────>│                            │
+     │                                         │  10. decode 失敗（exp 過期）│
+     │  11. 401 → 前端跳轉登入頁               │                            │
+     │<────────────────────────────────────────│                            │
+```
+
+**Token 架構：Access Token + Refresh Token**
+
+CoveFlow 使用 **短效 Access Token（15 min JWT）+ 長效 Refresh Token（7 天 UUID, HttpOnly Cookie）** 雙 token 架構，支援 token rotation 和 DB-backed revocation。
+
+詳細設計（schema、token flow、cookie 設定、rotation 策略、安全分析）見 **[PRD/12-refresh-token.md](./12-refresh-token.md)**。
+
 #### Auth（JWT + Argon2 + RBAC）
 
 ```rust
@@ -2146,41 +2457,51 @@ use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey}
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Claims { email: String, exp: u64 }
 
-/// 認證後的使用者上下文（每個 request 都會帶著）
-/// require_auth middleware 會從 DB 查詢 groups + folders
+/// Folder access level: Owner > Writer > Reader
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FolderRole {
+    Reader,
+    Writer,
+    Owner,
+}
+
+/// Authenticated user context, injected by require_auth middleware into every request.
+/// The middleware queries DB for workspace membership, teams, and folder ACL.
 #[derive(Clone, Debug)]
 pub struct AuthedUser {
     pub email: String,
     pub workspace_id: String,
     pub is_admin: bool,
-    /// 使用者所屬的團隊列表 e.g. ["ml-team", "data-eng"]
+    /// Teams the user belongs to, e.g. ["ml-team", "data-eng"]
     pub teams: Vec<String>,
-    /// 使用者的權限主體列表（用於 extra_perms 比對）
+    /// Permission subjects for ACL matching
     /// e.g. ["users/alice", "teams/ml-team", "teams/data-eng"]
     pub perm_subjects: Vec<String>,
-    /// 使用者可存取的 folder → 權限等級
-    /// true = read+write, false = read-only
-    pub folders: HashMap<String, bool>,
+    /// Accessible folders -> highest role among all matching subjects
+    pub folders: HashMap<String, FolderRole>,
 }
 
 impl AuthedUser {
-    /// 是否有某路徑的寫入權限
+    /// Check write permission for a path
     pub fn can_write(&self, path: &str) -> bool {
         if self.is_admin { return true; }
-        // 個人路徑：users/alice/... → 只有 alice 可寫
+        // Personal path: users/alice/... -> only alice can write
         if let Some(owner) = path.strip_prefix("users/") {
             let owner_email_part = owner.split('/').next().unwrap_or("");
             return self.email.starts_with(owner_email_part);
         }
-        // Folder 路徑：folders/ml-team/... → 查 folder extra_perms
+        // Folder path: folders/ml-team/... -> check folder_acl role
         if let Some(folder_name) = path.strip_prefix("folders/") {
             let folder_name = folder_name.split('/').next().unwrap_or("");
-            return self.folders.get(folder_name).copied() == Some(true);
+            return matches!(
+                self.folders.get(folder_name),
+                Some(FolderRole::Writer | FolderRole::Owner)
+            );
         }
         false
     }
 
-    /// 是否有某路徑的讀取權限
+    /// Check read permission for a path
     pub fn can_read(&self, path: &str) -> bool {
         if self.is_admin { return true; }
         if let Some(owner) = path.strip_prefix("users/") {
@@ -2189,25 +2510,41 @@ impl AuthedUser {
         }
         if let Some(folder_name) = path.strip_prefix("folders/") {
             let folder_name = folder_name.split('/').next().unwrap_or("");
-            return self.folders.contains_key(folder_name); // true 或 false 都有讀取權
+            return self.folders.contains_key(folder_name); // any role grants read
         }
         false
     }
 
-    /// 要求寫入權限，否則回 403
+    /// Check if user is folder owner
+    pub fn is_folder_owner(&self, folder_name: &str) -> bool {
+        if self.is_admin { return true; }
+        matches!(self.folders.get(folder_name), Some(FolderRole::Owner))
+    }
+
+    /// Require owner permission, return 403 if denied
+    pub fn require_owner(&self, path: &str) -> Result<(), ApiError> {
+        if self.is_admin { return Ok(()); }
+        if let Some(folder_name) = path.strip_prefix("folders/") {
+            let folder_name = folder_name.split('/').next().unwrap_or("");
+            if self.is_folder_owner(folder_name) { return Ok(()); }
+        }
+        Err(ApiError::Forbidden(format!("no owner access to '{}'", path)))
+    }
+
+    /// Require write permission, return 403 if denied
     pub fn require_writer(&self, path: &str) -> Result<(), ApiError> {
         if self.can_write(path) { Ok(()) }
         else { Err(ApiError::Forbidden(format!("no write access to '{}'", path))) }
     }
 
-    /// 要求讀取權限，否則回 403
+    /// Require read permission, return 403 if denied
     pub fn require_reader(&self, path: &str) -> Result<(), ApiError> {
         if self.can_read(path) { Ok(()) }
         else { Err(ApiError::Forbidden(format!("no read access to '{}'", path))) }
     }
 }
 
-/// Auth middleware：JWT 解碼 → 查 DB 取 groups + folders → 注入 Extension
+/// Auth middleware: decode JWT -> query DB for teams + folder ACL -> inject Extension
 pub async fn require_auth(
     State(db): State<PgPool>,
     Path(workspace_id): Path<String>,
@@ -2223,7 +2560,7 @@ pub async fn require_auth(
         .map_err(|_| ApiError::Unauthorized)?
         .claims;
 
-    // 1. 查 workspace_member 確認角色
+    // 1. Verify workspace membership and role
     let member = sqlx::query!(
         "SELECT role FROM workspace_member WHERE workspace_id = $1 AND email = $2",
         workspace_id, claims.email
@@ -2232,47 +2569,42 @@ pub async fn require_auth(
 
     let is_admin = member.role == "admin";
 
-    // 2. 查使用者所屬的 teams
+    // 2. Load user's teams
     let teams: Vec<String> = sqlx::query_scalar!(
         "SELECT team_name FROM team_member WHERE workspace_id = $1 AND email = $2",
         workspace_id, claims.email
     ).fetch_all(&db).await?;
 
-    // 3. 建立權限主體列表
+    // 3. Build permission subjects list
     let mut perm_subjects = vec![format!("users/{}", claims.email)];
     for t in &teams {
         perm_subjects.push(format!("teams/{}", t));
     }
 
-    // 4. 查所有 folder 的 extra_perms，找出此使用者可存取的 folders
-    //    SQL: 展開 extra_perms JSONB，比對 perm_subjects
-    let folder_rows = sqlx::query!(
-        r#"SELECT f.name, perm.key, perm.value::text as access
-           FROM folder f,
-           LATERAL jsonb_each(f.extra_perms) AS perm(key, value)
-           WHERE f.workspace_id = $1
-             AND perm.key = ANY($2)
-           UNION
-           SELECT f.name, unnest(f.owners), 'true'
-           FROM folder f
-           WHERE f.workspace_id = $1
-             AND f.owners && $2"#,
+    // 4. Load folder ACL (simple SELECT from normalized folder_acl table)
+    let acl_rows = sqlx::query!(
+        "SELECT folder_name, role FROM folder_acl
+         WHERE workspace_id = $1 AND subject = ANY($2)",
         workspace_id, &perm_subjects
     ).fetch_all(&db).await?;
 
-    let mut folders = HashMap::new();
-    for row in folder_rows {
-        let write = row.access.as_deref() == Some("true");
-        // 如果多個 group 都有權限，取最高權限（true > false）
-        let current = folders.entry(row.name).or_insert(false);
-        if write { *current = true; }
+    let mut folders: HashMap<String, FolderRole> = HashMap::new();
+    for row in acl_rows {
+        let role = match row.role.as_str() {
+            "owner" => FolderRole::Owner,
+            "writer" => FolderRole::Writer,
+            _ => FolderRole::Reader,
+        };
+        // If multiple subjects grant access, keep the highest role
+        let current = folders.entry(row.folder_name).or_insert(FolderRole::Reader);
+        if role > *current { *current = role; }
     }
 
     let user = AuthedUser {
         email: claims.email,
         workspace_id,
         is_admin,
-        groups,
+        teams,
         perm_subjects,
         folders,
     };
@@ -2436,7 +2768,7 @@ pub async fn run_preview(
 ```rust
 // crates/api/src/jobs.rs
 
-/// POST /api/w/{ws}/jobs/run_wait_result/p/{path}
+/// POST /api/workspaces/{ws}/jobs/run_wait_result/p/{path}
 /// 推入 job → 阻塞等完成 → 回傳結果（或超時）
 pub async fn run_wait_result_script(
     State(state): State<AppState>,
@@ -2850,7 +3182,7 @@ pub struct LogStreamParams {
 
   $effect(() => {
     if (!jobId) return
-    const url = `/api/w/${workspaceId}/jobs/${jobId}/logs/stream?level=${minLevel}`
+    const url = `/api/workspaces/${workspaceId}/jobs/${jobId}/logs/stream?level=${minLevel}`
     const eventSource = new EventSource(url)
 
     eventSource.addEventListener('log', (e) => {
@@ -3619,7 +3951,7 @@ fn serde_json_to_js_value(val: &serde_json::Value, ctx: &mut Context) -> Result<
   })
 
   async function loadFlowFiles() {
-    const resp = await fetch(`/api/w/${workspaceId}/flows/files/p/${flowPath}`)
+    const resp = await fetch(`/api/workspaces/${workspaceId}/flows/files/p/${flowPath}`)
     flowFiles = await resp.json()
   }
 
@@ -3727,7 +4059,7 @@ fn serde_json_to_js_value(val: &serde_json::Value, ctx: &mut Context) -> Result<
       files={flowFiles}
       onFileClick={onFileClick}
       onCreateFile={async (path) => {
-        await fetch(`/api/w/${workspaceId}/flows/files/p/${flowPath}`, {
+        await fetch(`/api/workspaces/${workspaceId}/flows/files/p/${flowPath}`, {
           method: 'PUT', body: JSON.stringify({ file_path: path, content: '' })
         })
         await loadFlowFiles()
@@ -3903,19 +4235,19 @@ fn serde_json_to_js_value(val: &serde_json::Value, ctx: &mut Context) -> Result<
   let compareFrom = $state<number | null>(null)
 
   $effect(() => {
-    fetch(`/api/w/${workspaceId}/flows/revisions/p/${flowPath}`)
+    fetch(`/api/workspaces/${workspaceId}/flows/revisions/p/${flowPath}`)
       .then(r => r.json())
       .then(r => revisions = r)
   })
 
   async function showDiff(from: number, to: number) {
-    const resp = await fetch(`/api/w/${workspaceId}/flows/diff/p/${flowPath}?from=${from}&to=${to}`)
+    const resp = await fetch(`/api/workspaces/${workspaceId}/flows/diff/p/${flowPath}?from=${from}&to=${to}`)
     diffResult = await resp.json()
   }
 
   async function rollback(targetRevision: number) {
     if (!confirm(`Rollback to revision ${targetRevision}?`)) return
-    await fetch(`/api/w/${workspaceId}/flows/rollback/p/${flowPath}/rev/${targetRevision}`, { method: 'POST' })
+    await fetch(`/api/workspaces/${workspaceId}/flows/rollback/p/${flowPath}/rev/${targetRevision}`, { method: 'POST' })
     location.reload()
   }
 </script>
@@ -4232,24 +4564,24 @@ async fn prepare_flow_workspace(
 
 ```rust
 // === Flow CRUD + 版本控制 ===
-POST   /api/w/{ws}/flows/save/p/{path}               // 儲存（自動建新 revision）
-GET    /api/w/{ws}/flows/list                          // 列出 flows（含最新 revision）
-GET    /api/w/{ws}/flows/get/p/{path}                  // 取得最新版
-GET    /api/w/{ws}/flows/get/p/{path}/rev/{rev}        // 取得指定版本
-GET    /api/w/{ws}/flows/revisions/p/{path}            // 版本歷史
-GET    /api/w/{ws}/flows/diff/p/{path}?from=2&to=3     // Diff 兩版本
-POST   /api/w/{ws}/flows/rollback/p/{path}/rev/{rev}   // Rollback
+POST   /api/workspaces/{ws}/flows/save/p/{path}               // 儲存（自動建新 revision）
+GET    /api/workspaces/{ws}/flows/list                          // 列出 flows（含最新 revision）
+GET    /api/workspaces/{ws}/flows/get/p/{path}                  // 取得最新版
+GET    /api/workspaces/{ws}/flows/get/p/{path}/rev/{rev}        // 取得指定版本
+GET    /api/workspaces/{ws}/flows/revisions/p/{path}            // 版本歷史
+GET    /api/workspaces/{ws}/flows/diff/p/{path}?from=2&to=3     // Diff 兩版本
+POST   /api/workspaces/{ws}/flows/rollback/p/{path}/rev/{rev}   // Rollback
 
 // === Flow 工作區檔案 ===
-GET    /api/w/{ws}/flows/files/p/{path}                // 列出檔案
-GET    /api/w/{ws}/flows/files/p/{path}/f/{file_path}  // 讀取檔案
-PUT    /api/w/{ws}/flows/files/p/{path}                // 建立/更新檔案
-DELETE /api/w/{ws}/flows/files/p/{path}/f/{file_path}  // 刪除檔案
+GET    /api/workspaces/{ws}/flows/files/p/{path}                // 列出檔案
+GET    /api/workspaces/{ws}/flows/files/p/{path}/f/{file_path}  // 讀取檔案
+PUT    /api/workspaces/{ws}/flows/files/p/{path}                // 建立/更新檔案
+DELETE /api/workspaces/{ws}/flows/files/p/{path}/f/{file_path}  // 刪除檔案
 
 // === Job 執行 ===
-POST   /api/w/{ws}/jobs/run/f/{path}                   // 執行 flow（最新版）
-POST   /api/w/{ws}/jobs/run/f/{path}/rev/{rev}         // 執行指定版本
-GET    /api/w/{ws}/jobs/{id}/flow_status                // 查詢 flow 執行狀態
+POST   /api/workspaces/{ws}/jobs/run/f/{path}                   // 執行 flow（最新版）
+POST   /api/workspaces/{ws}/jobs/run/f/{path}/rev/{rev}         // 執行指定版本
+GET    /api/workspaces/{ws}/jobs/{id}/flow_status                // 查詢 flow 執行狀態
 ```
 
 ### 2.9 驗證方式
@@ -4635,9 +4967,9 @@ value:
 **新增 API：**
 
 ```
-GET  /api/w/{ws}/flows/export/p/{path}?format=yaml   → YAML 字串
-GET  /api/w/{ws}/flows/export/p/{path}?format=json   → JSON
-POST /api/w/{ws}/flows/import                         → 匯入
+GET  /api/workspaces/{ws}/flows/export/p/{path}?format=yaml   → YAML 字串
+GET  /api/workspaces/{ws}/flows/export/p/{path}?format=json   → JSON
+POST /api/workspaces/{ws}/flows/import                         → 匯入
 ```
 
 ### 3.5 Tag 級並發控制（學習 Prefect ConcurrencyLimit）
@@ -4674,9 +5006,9 @@ async fn check_concurrency_limit(
 **API：**
 
 ```
-PUT    /api/w/{ws}/concurrency_limits/{tag}   // 設定限制（max_concurrent）
-GET    /api/w/{ws}/concurrency_limits          // 列出所有限制
-DELETE /api/w/{ws}/concurrency_limits/{tag}    // 刪除限制
+PUT    /api/workspaces/{ws}/concurrency_limits/{tag}   // 設定限制（max_concurrent）
+GET    /api/workspaces/{ws}/concurrency_limits          // 列出所有限制
+DELETE /api/workspaces/{ws}/concurrency_limits/{tag}    // 刪除限制
 ```
 
 ### 3.6 Schedule 增加 data_interval（學習 Airflow）
@@ -4998,7 +5330,7 @@ impl TriggerHandler {
 #[derive(Deserialize, Default)]
 pub enum RequestType { #[default] Async, Sync, SyncSse }
 
-/// POST /api/w/{ws}/webhooks/{path}?mode=sync
+/// POST /api/workspaces/{ws}/webhooks/{path}?mode=sync
 /// 外部系統呼叫此 endpoint 觸發 job
 pub async fn handle_webhook(
     State(state): State<AppState>,
@@ -5103,13 +5435,13 @@ Phase 4+: KafkaTrigger / MqttTrigger / NatsTrigger / PostgresCdcTrigger
 
 ```
 // Webhook 管理
-POST   /api/w/{ws}/webhook_triggers/create          // 建立 webhook trigger
-GET    /api/w/{ws}/webhook_triggers/list             // 列出
-DELETE /api/w/{ws}/webhook_triggers/{path}           // 刪除
-PUT    /api/w/{ws}/webhook_triggers/{path}/toggle    // 啟用/停用
+POST   /api/workspaces/{ws}/webhook_triggers/create          // 建立 webhook trigger
+GET    /api/workspaces/{ws}/webhook_triggers/list             // 列出
+DELETE /api/workspaces/{ws}/webhook_triggers/{path}           // 刪除
+PUT    /api/workspaces/{ws}/webhook_triggers/{path}/toggle    // 啟用/停用
 
 // Webhook 觸發（外部呼叫）
-POST   /api/w/{ws}/webhooks/{path}                   // 觸發 job
+POST   /api/workspaces/{ws}/webhooks/{path}                   // 觸發 job
 ```
 
 ### 3.9 Deploy Approval Gate 實作
@@ -6045,13 +6377,14 @@ ClusterDashboard 頁面（/workers）：
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 3.12 Group + Folder + ACL + Quota 實作
+### 3.12 Team + Folder + ACL + Quota 實作
 
-**核心邏輯**：團隊管理、路徑級 ACL、配額執行。Schema 已在 1.1 定義，Auth middleware 已在 1.6 整合。
+**核心邏輯**：團隊管理、路徑級 ACL（正規化 folder_acl 表）、配額執行。
+Schema 已在 1.1 定義，Auth middleware 已在 1.6 整合。
 本節實作 CRUD API 和進階整合邏輯。
 
 ```rust
-// crates/api/src/groups.rs
+// crates/api/src/teams.rs
 
 use crate::auth::AuthedUser;
 
@@ -6073,7 +6406,7 @@ pub async fn list_teams(
     Ok(Json(teams))
 }
 
-/// 建立 team（admin only）
+/// Create team (admin only). Also creates a same-name folder with the team as owner.
 pub async fn create_team(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
@@ -6083,46 +6416,75 @@ pub async fn create_team(
     if !user.is_admin {
         return Err(ApiError::Forbidden("admin only".into()));
     }
+
+    let mut tx = state.db.begin().await?;
+
     sqlx::query!(
         "INSERT INTO team (workspace_id, name, summary) VALUES ($1, $2, $3)",
         workspace_id, req.name, req.summary.unwrap_or_default()
-    ).execute(&state.db).await?;
+    ).execute(&mut *tx).await?;
 
-    // 自動建立同名 folder（團隊慣例：team "ml-team" → folder "ml-team"）
+    // Auto-create same-name folder (convention: team "ml-team" -> folder "ml-team")
     sqlx::query!(
-        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO folder (workspace_id, name, display_name)
+         VALUES ($1, $2, $3)
          ON CONFLICT DO NOTHING",
         workspace_id, req.name, req.name,
-        &[format!("teams/{}", req.name)],          // team 是 folder 的 owner
-        serde_json::json!({format!("teams/{}", req.name): true}), // team 成員有讀寫權
-    ).execute(&state.db).await?;
+    ).execute(&mut *tx).await?;
 
+    // Grant the team owner role on its folder + manager role on team_acl
+    let subject = format!("teams/{}", req.name);
+    sqlx::query!(
+        "INSERT INTO folder_acl (workspace_id, folder_name, subject, role)
+         VALUES ($1, $2, $3, 'owner')
+         ON CONFLICT DO NOTHING",
+        workspace_id, req.name, subject,
+    ).execute(&mut *tx).await?;
+
+    sqlx::query!(
+        "INSERT INTO team_acl (workspace_id, team_name, subject, role)
+         VALUES ($1, $2, $3, 'manager')
+         ON CONFLICT DO NOTHING",
+        workspace_id, req.name, subject,
+    ).execute(&mut *tx).await?;
+
+    tx.commit().await?;
     Ok(StatusCode::CREATED)
 }
 
-/// 新增成員到 team
+/// Check if user can manage this team (admin or has 'manager' role in team_acl)
+async fn require_team_manager(
+    user: &AuthedUser,
+    db: &PgPool,
+    workspace_id: &str,
+    team_name: &str,
+) -> Result<(), ApiError> {
+    if user.is_admin {
+        return Ok(());
+    }
+    let has_access = sqlx::query_scalar!(
+        "SELECT EXISTS(
+            SELECT 1 FROM team_acl
+            WHERE workspace_id = $1 AND team_name = $2 AND subject = ANY($3)
+        ) as \"exists!: bool\"",
+        workspace_id, team_name, &user.perm_subjects
+    ).fetch_one(db).await?;
+
+    if has_access {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("no permission to manage this team".into()))
+    }
+}
+
+/// Add member to team (admin or team manager via team_acl)
 pub async fn add_member(
     State(state): State<AppState>,
     Path((workspace_id, team_name)): Path<(String, String)>,
     Extension(user): Extension<AuthedUser>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // 只有 admin 或 team extra_perms 中有寫入權限的人可加成員
-    if !user.is_admin {
-        let team = sqlx::query!(
-            "SELECT extra_perms FROM team WHERE workspace_id = $1 AND name = $2",
-            workspace_id, team_name
-        ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
-
-        let perms = team.extra_perms;
-        let can_manage = user.perm_subjects.iter().any(|subj| {
-            perms.get(subj).and_then(|v| v.as_bool()) == Some(true)
-        });
-        if !can_manage {
-            return Err(ApiError::Forbidden("no permission to manage this team".into()));
-        }
-    }
+    require_team_manager(&user, &state.db, &workspace_id, &team_name).await?;
 
     sqlx::query!(
         "INSERT INTO team_member (workspace_id, email, team_name)
@@ -6132,15 +6494,13 @@ pub async fn add_member(
     Ok(StatusCode::CREATED)
 }
 
-/// 移除成員
+/// Remove member from team (admin or team manager via team_acl)
 pub async fn remove_member(
     State(state): State<AppState>,
     Path((workspace_id, team_name, email)): Path<(String, String, String)>,
     Extension(user): Extension<AuthedUser>,
 ) -> Result<StatusCode, ApiError> {
-    if !user.is_admin {
-        return Err(ApiError::Forbidden("admin only".into()));
-    }
+    require_team_manager(&user, &state.db, &workspace_id, &team_name).await?;
     sqlx::query!(
         "DELETE FROM team_member WHERE workspace_id = $1 AND email = $2 AND team_name = $3",
         workspace_id, email, team_name
@@ -6150,32 +6510,60 @@ pub async fn remove_member(
 
 // crates/api/src/folders.rs
 
-/// 列出使用者可見的 folder
+/// List folders visible to the user
 pub async fn list_folders(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
     Extension(user): Extension<AuthedUser>,
 ) -> Result<Json<Vec<FolderInfo>>, ApiError> {
     if user.is_admin {
-        // admin 看到所有 folder
+        // Admin sees all folders with their ACL entries
         let folders = sqlx::query_as!(FolderInfo,
-            "SELECT name, display_name, owners, extra_perms FROM folder WHERE workspace_id = $1",
+            "SELECT f.name, f.display_name,
+                    COALESCE(
+                        (SELECT json_agg(json_build_object('subject', a.subject, 'role', a.role))
+                         FROM folder_acl a
+                         WHERE a.workspace_id = f.workspace_id AND a.folder_name = f.name),
+                        '[]'::json
+                    ) as \"acl!: serde_json::Value\"
+             FROM folder f WHERE f.workspace_id = $1
+             ORDER BY f.name",
             workspace_id
         ).fetch_all(&state.db).await?;
         return Ok(Json(folders));
     }
 
-    // 非 admin：只看到自己有權限的 folder（已在 auth middleware 計算好）
-    let visible_names: Vec<&String> = user.folders.keys().collect();
+    // Non-admin: only see folders they have access to (pre-computed in auth middleware)
+    let visible_names: Vec<&str> = user.folders.keys().map(|s| s.as_str()).collect();
     let folders = sqlx::query_as!(FolderInfo,
-        "SELECT name, display_name, owners, extra_perms FROM folder
-         WHERE workspace_id = $1 AND name = ANY($2)",
-        workspace_id, &visible_names.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+        "SELECT f.name, f.display_name,
+                COALESCE(
+                    (SELECT json_agg(json_build_object('subject', a.subject, 'role', a.role))
+                     FROM folder_acl a
+                     WHERE a.workspace_id = f.workspace_id AND a.folder_name = f.name),
+                    '[]'::json
+                ) as \"acl!: serde_json::Value\"
+         FROM folder f
+         WHERE f.workspace_id = $1 AND f.name = ANY($2)",
+        workspace_id, &visible_names
     ).fetch_all(&state.db).await?;
     Ok(Json(folders))
 }
 
-/// 建立 folder（admin only）
+#[derive(serde::Deserialize)]
+pub struct AclEntry {
+    pub subject: String,
+    pub role: String,  // "owner", "writer", "reader"
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateFolderRequest {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub acl: Option<Vec<AclEntry>>,
+}
+
+/// Create folder (admin only) with optional initial ACL entries
 pub async fn create_folder(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
@@ -6185,43 +6573,84 @@ pub async fn create_folder(
     if !user.is_admin {
         return Err(ApiError::Forbidden("admin only".into()));
     }
+
+    let mut tx = state.db.begin().await?;
+
     sqlx::query!(
-        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms)
-         VALUES ($1, $2, $3, $4, $5)",
-        workspace_id, req.name, req.display_name.unwrap_or(req.name.clone()),
-        &req.owners.unwrap_or_default(),
-        serde_json::to_value(&req.extra_perms.unwrap_or_default())?,
-    ).execute(&state.db).await?;
+        "INSERT INTO folder (workspace_id, name, display_name) VALUES ($1, $2, $3)",
+        workspace_id, req.name,
+        req.display_name.as_deref().unwrap_or(&req.name),
+    ).execute(&mut *tx).await?;
+
+    // Insert initial ACL entries
+    if let Some(acl) = &req.acl {
+        for entry in acl {
+            sqlx::query!(
+                "INSERT INTO folder_acl (workspace_id, folder_name, subject, role)
+                 VALUES ($1, $2, $3, $4)",
+                workspace_id, req.name, entry.subject, entry.role,
+            ).execute(&mut *tx).await?;
+        }
+    }
+
+    tx.commit().await?;
     Ok(StatusCode::CREATED)
 }
 
-/// 更新 folder ACL（owners 或 admin）
+#[derive(serde::Deserialize)]
+pub struct UpdateFolderAclRequest {
+    /// ACL entries to set (upsert). Omitted subjects are unchanged.
+    pub set: Option<Vec<AclEntry>>,
+    /// Subjects to remove from ACL entirely.
+    pub remove: Option<Vec<String>>,
+}
+
+/// Update folder ACL (folder owners or admin only)
 pub async fn update_folder_acl(
     State(state): State<AppState>,
     Path((workspace_id, folder_name)): Path<(String, String)>,
     Extension(user): Extension<AuthedUser>,
     Json(req): Json<UpdateFolderAclRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // 檢查是否為 folder owner 或 admin
-    if !user.is_admin {
-        let folder = sqlx::query!(
-            "SELECT owners FROM folder WHERE workspace_id = $1 AND name = $2",
-            workspace_id, folder_name
-        ).fetch_optional(&state.db).await?.ok_or(ApiError::NotFound)?;
+    // Check folder ownership using AuthedUser (no extra DB query needed)
+    if !user.is_folder_owner(&folder_name) {
+        return Err(ApiError::Forbidden(
+            "only folder owners or admins can update ACL".into()
+        ));
+    }
 
-        let is_owner = folder.owners.iter().any(|o| user.perm_subjects.contains(o));
-        if !is_owner {
-            return Err(ApiError::Forbidden("only folder owners or admins can update ACL".into()));
+    // Verify folder exists
+    sqlx::query!(
+        "SELECT 1 as _e FROM folder WHERE workspace_id = $1 AND name = $2",
+        workspace_id, folder_name
+    ).fetch_optional(&state.db).await?
+     .ok_or(ApiError::NotFound)?;
+
+    let mut tx = state.db.begin().await?;
+
+    // Upsert ACL entries
+    if let Some(entries) = &req.set {
+        for entry in entries {
+            sqlx::query!(
+                "INSERT INTO folder_acl (workspace_id, folder_name, subject, role)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (workspace_id, folder_name, subject)
+                 DO UPDATE SET role = EXCLUDED.role",
+                workspace_id, folder_name, entry.subject, entry.role,
+            ).execute(&mut *tx).await?;
         }
     }
 
-    // 合併更新 extra_perms（不是整個覆蓋，而是 merge）
-    sqlx::query!(
-        "UPDATE folder SET extra_perms = extra_perms || $3
-         WHERE workspace_id = $1 AND name = $2",
-        workspace_id, folder_name,
-        serde_json::to_value(&req.extra_perms)?,
-    ).execute(&state.db).await?;
+    // Remove subjects
+    if let Some(subjects) = &req.remove {
+        sqlx::query!(
+            "DELETE FROM folder_acl
+             WHERE workspace_id = $1 AND folder_name = $2 AND subject = ANY($3)",
+            workspace_id, folder_name, subjects,
+        ).execute(&mut *tx).await?;
+    }
+
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
@@ -7015,7 +7444,7 @@ pub async fn preview_query(
     }))
 }
 
-// POST /api/w/{ws}/data/preview
+// POST /api/workspaces/{ws}/data/preview
 ```
 
 **前端元件：**
@@ -7042,7 +7471,7 @@ pub async fn preview_query(
     loading = true
     error = null
     try {
-      const resp = await fetch(`/api/w/${workspaceId}/data/preview`, {
+      const resp = await fetch(`/api/workspaces/${workspaceId}/data/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ engine, query, sources: [] }),
